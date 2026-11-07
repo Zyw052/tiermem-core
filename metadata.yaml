@@ -1,0 +1,5 @@
+name: astrbot_plugin_agent_memory
+desc: 智涌原生分层记忆插件 (L1工作区/L2情景/L3画像 + 独立总结模型 + 资产无缝迁移 + 专属WebUI)
+version: 1.0.0
+author: Vivian & Master
+repo: ""

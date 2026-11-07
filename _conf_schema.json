@@ -1,0 +1,99 @@
+{
+  "enable_memory": {
+    "description": "启用分层记忆系统",
+    "type": "bool",
+    "default": true,
+    "hint": "全局开关，控制是否启用 L1/L2/L3 记忆自动召回与归档"
+  },
+  "summarizer": {
+    "description": "独立总结与提炼模型配置",
+    "type": "object",
+    "items": {
+      "provider_id": {
+        "description": "LLM 提供商 ID (留空则复用当前会话模型)",
+        "type": "string",
+        "default": "",
+        "hint": "建议配置轻量高性价比模型用于后台 L1/L2/L3 记忆提炼"
+      },
+      "embedding_provider_id": {
+        "description": "Embedding 提供商 ID",
+        "type": "string",
+        "default": "",
+        "hint": "用于 L2 情景记忆向量化检索"
+      },
+      "max_concurrency": {
+        "description": "后台总结最大并发数",
+        "type": "int",
+        "default": 2
+      },
+      "timeout_seconds": {
+        "description": "总结请求超时时间(秒)",
+        "type": "int",
+        "default": 45
+      }
+    }
+  },
+  "retrieval": {
+    "description": "混合检索与权重参数",
+    "type": "object",
+    "items": {
+      "top_k": {
+        "description": "单次召回最大记忆条数",
+        "type": "int",
+        "default": 6
+      },
+      "weight_vector": {
+        "description": "向量语义相似度权重",
+        "type": "float",
+        "default": 0.55
+      },
+      "weight_bm25": {
+        "description": "BM25 关键词检索权重",
+        "type": "float",
+        "default": 0.30
+      },
+      "weight_importance": {
+        "description": "重要度与时间衰减权重",
+        "type": "float",
+        "default": 0.15
+      }
+    }
+  },
+  "migration": {
+    "description": "旧记忆资产迁移配置",
+    "type": "object",
+    "items": {
+      "auto_detect_legacy": {
+        "description": "启动时自动检测旧插件记忆资产",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "webui": {
+    "description": "专属记忆管理 WebUI 配置",
+    "type": "object",
+    "items": {
+      "enable": {
+        "description": "启用专属 WebUI 面板",
+        "type": "bool",
+        "default": false
+      },
+      "host": {
+        "description": "监听地址",
+        "type": "string",
+        "default": "127.0.0.1"
+      },
+      "port": {
+        "description": "监听端口",
+        "type": "int",
+        "default": 18899
+      },
+      "access_token": {
+        "description": "WebUI 访问令牌",
+        "type": "string",
+        "default": ""
+      }
+    }
+  }
+}
