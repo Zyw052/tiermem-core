@@ -1,22 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-astrbot_plugin_agent_memory - 插件主入口 (Stage 1 完整总装)
+astrbot_plugin_agent_memory - 插件主入口 (Stage 2 双向钩子总装)
 
 职责：
-1. 规范解析插件配置（summary_turn_interval / db_path / models / retrieval ...）；
+1. 规范解析插件配置（summary_turn_interval / db_path / models / retrieval / 注入开关 ...）；
 2. 全量装配核心组件：
    StorageManager → EmbeddingClient → RerankClient → MemorySummarizer → MemoryRetriever；
 3. 生命周期托管：
    - initialize(): 启动 summarizer 后台 Worker；
    - terminate(): flush_all() 冲洗剩余轮次 → stop() 停 Worker → close() 关闭存储；
-4. 对外提供 record_turn / flush_session / retrieve_memory 三个稳定 API，
-   供 Stage 2 的事件钩子与指令层复用。
+4. Stage 2 双向钩子：
+   - on_llm_request       : 前置拦截，两阶段检索 → 注入 System Prompt 前部；
+   - on_llm_response      : 后置拦截，用户输入 + 回复 → 推入多轮缓冲池；
+   - on_decorating_result : 仅在缺少 on_llm_response 时作为兜底记录点；
+   所有钩子全量 try-except，异常静默降级，绝不影响 AstrBot 正常对话流。
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -32,14 +36,24 @@ except Exception:  # pragma: no cover - 仅非 AstrBot 环境触发
 
 from astrbot.api.star import Context, Star, register
 
-# on_llm_response 装饰器按可用性接入：缺失时插件仍可正常加载（Stage 2 再补全钩子）
+# Stage 2 双向钩子装饰器按可用性接入：
+# - on_llm_request       : LLM 请求前置，可写 req.system_prompt（记忆注入）
+# - on_llm_response      : LLM 响应后置，读取 resp.completion_text（轮次记录）
+# - on_decorating_result : 发送前事件（仅作为 on_llm_response 缺失时的兜底记录点）
+# 任一装饰器缺失都不会阻断插件加载，钩子按能力矩阵逐个装配。
 try:
     from astrbot.api.event import filter as event_filter
 except Exception:  # pragma: no cover
     event_filter = None  # type: ignore
 
+_ON_LLM_REQUEST = (
+    getattr(event_filter, "on_llm_request", None) if event_filter is not None else None
+)
 _ON_LLM_RESPONSE = (
     getattr(event_filter, "on_llm_response", None) if event_filter is not None else None
+)
+_ON_DECORATING_RESULT = (
+    getattr(event_filter, "on_decorating_result", None) if event_filter is not None else None
 )
 
 # ---------------------------------------------------------------------------
@@ -71,6 +85,19 @@ DEFAULT_RERANK_API_BASE = "https://api.siliconflow.cn/v1"
 DEFAULT_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 DEFAULT_RERANK_TIMEOUT = 20.0
 DEFAULT_RRF_K = 60
+
+# ---- Stage 2 钩子相关默认值 ----
+DEFAULT_RETRIEVE_TIMEOUT = 3.0
+"""前置检索最大等待秒数；超时即静默降级，绝不拖慢主对话。"""
+
+DEFAULT_INJECTION_MAX_CHARS = 2000
+"""注入 System Prompt 的记忆块字符上限，0 表示不限制。"""
+
+DEFAULT_RECORD_DEDUP_WINDOW = 2.0
+"""轮次记录去重时间窗（秒）：同一会话相同内容在该窗口内只记一次，防重复回调。"""
+
+MEMORY_BLOCK_MARKER = "<!-- agent_memory:injected:v1 -->"
+"""记忆注入块占位标记：用于识别并阻止同一请求内的重复注入。"""
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +156,91 @@ def _resolve_plugin_data_dir(plugin_name: str = PLUGIN_NAME) -> Path:
         return plugin_dir.parent.parent / "plugin_data" / plugin_name
 
 
+# ---------------------------------------------------------------------------
+# Stage 2：事件/请求对象的安全字段提取（AstrBot 属性可能是 property，读取可能抛错）
+# ---------------------------------------------------------------------------
+def _safe_attr(obj: Any, name: str, default: Any = None) -> Any:
+    """安全读取对象属性：obj 为空或属性访问抛异常时返回 default。"""
+    if obj is None:
+        return default
+    try:
+        return getattr(obj, name, default)
+    except Exception:
+        return default
+
+
+def _extract_session_id(event: Any = None, req: Any = None) -> str:
+    """
+    提取会话标识。优先级：
+    req.session_id → event.unified_msg_origin → event.session_id。
+    统一为字符串，避免下游按 None 做 key。
+    """
+    return str(
+        _first_non_empty(
+            _safe_attr(req, "session_id"),
+            _safe_attr(event, "unified_msg_origin"),
+            _safe_attr(event, "session_id"),
+            default="",
+        )
+    )
+
+
+def _extract_user_query(event: Any = None, req: Any = None) -> str:
+    """
+    提取用户当前 Query。优先级：
+    req.prompt（LLM 实际请求的提示词）→ event.message_str → event.message_text。
+    """
+    return str(
+        _first_non_empty(
+            _safe_attr(req, "prompt"),
+            _safe_attr(event, "message_str"),
+            _safe_attr(event, "message_text"),
+            default="",
+        )
+    )
+
+
+def _extract_assistant_text(resp: Any) -> str:
+    """
+    提取 Assistant 回复纯文本。优先 completion_text（property，内部聚合 result_chain），
+    其次 completion / text 字段兜底。
+    """
+    return str(
+        _first_non_empty(
+            _safe_attr(resp, "completion_text"),
+            _safe_attr(resp, "completion"),
+            _safe_attr(resp, "text"),
+            default="",
+        )
+    )
+
+
+def _extract_text_from_event_result(event: Any) -> str:
+    """
+    兜底路径（on_decorating_result）：从 event.get_result() 的消息链中取纯文本。
+    任何异常均返回空串。
+    """
+    try:
+        getter = getattr(event, "get_result", None)
+        if not callable(getter):
+            return ""
+        result = getter()
+        if result is None:
+            return ""
+        chain = _safe_attr(result, "chain") or _safe_attr(result, "message_chain")
+        get_plain = getattr(chain, "get_plain_text", None)
+        if callable(get_plain):
+            return str(_first_non_empty(get_plain(), default=""))
+        # 再兜底：result_chain.get_plain_text()
+        fallback_chain = _safe_attr(result, "result_chain")
+        get_plain_2 = getattr(fallback_chain, "get_plain_text", None)
+        if callable(get_plain_2):
+            return str(_first_non_empty(get_plain_2(), default=""))
+    except Exception:
+        return ""
+    return ""
+
+
 @register(
     PLUGIN_NAME,
     "Vivian & Master",
@@ -150,6 +262,10 @@ class AgentMemoryPlugin(Star):
         self.data_dir: Path = _resolve_plugin_data_dir(PLUGIN_NAME)
         self.enable_memory: bool = bool(self.config.get("enable_memory", True))
         self.turn_interval: int = self._resolve_turn_interval()
+        # Stage 2：前置注入开关（与总开关独立，便于只关注入保留沉淀）
+        self.enable_injection: bool = bool(
+            self.config.get("memory_injection_enable", True)
+        )
 
         # ---- 2. 组件占位（装配失败时保持为 None，插件不因此崩溃）----
         self.storage: Optional[MemoryStorage] = None
@@ -159,6 +275,18 @@ class AgentMemoryPlugin(Star):
         self.retriever: Optional[MemoryRetriever] = None
 
         self._initialized: bool = False
+
+        # ---- Stage 2 运行时状态（观测用，不参与控制流）----
+        self._last_recorded: Dict[str, tuple] = {}
+        """session_id -> (fingerprint, monotonic_ts)，用于短窗口去重。"""
+        self._hook_stats: Dict[str, int] = {
+            "inject_ok": 0,
+            "inject_skip": 0,
+            "inject_error": 0,
+            "record_ok": 0,
+            "record_skip": 0,
+            "record_error": 0,
+        }
 
         # ---- 3. 全量装配 ----
         try:
@@ -610,6 +738,14 @@ class AgentMemoryPlugin(Star):
                 "summarizer": self.summarizer is not None,
                 "retriever": self.retriever is not None,
             },
+            # ---- Stage 2 钩子能力矩阵与运行指标 ----
+            "hooks": {
+                "on_llm_request": _ON_LLM_REQUEST is not None,
+                "on_llm_response": _ON_LLM_RESPONSE is not None,
+                "on_decorating_result": _ON_DECORATING_RESULT is not None,
+                "injection_enabled": self.enable_injection,
+            },
+            "hook_stats": dict(self._hook_stats),
         }
         if self.summarizer is not None:
             try:
@@ -624,38 +760,302 @@ class AgentMemoryPlugin(Star):
         return status
 
     # ------------------------------------------------------------------
-    # LLM 响应钩子：把「用户输入 + 机器人回复」写入轮次缓冲池
-    # （宿主未提供 on_llm_response 时该方法不会被定义，插件仍可正常加载）
+    # Stage 2 核心一：前置检索注入（Prompt Injection）
     # ------------------------------------------------------------------
+    def _retrieval_runtime_cfg(self) -> Dict[str, Any]:
+        """汇总前置注入用到的检索侧运行时参数（带安全兜底）。"""
+        cfg = self._section("retrieval")
+        return {
+            "timeout": _safe_float(
+                cfg.get("retrieve_timeout"), DEFAULT_RETRIEVE_TIMEOUT
+            ),
+            "top_k": _safe_int(cfg.get("top_k"), 6, minimum=1),
+            "candidate_k": _safe_int(cfg.get("candidate_k"), 20, minimum=1),
+            "max_chars": _safe_int(
+                cfg.get("prompt_injection_max_chars"),
+                DEFAULT_INJECTION_MAX_CHARS,
+                minimum=0,
+            ),
+            "position": str(cfg.get("inject_position") or "head").strip().lower(),
+        }
+
+    @staticmethod
+    def format_memory_block(result: Any, max_chars: int = 0) -> str:
+        """
+        把检索结果格式化为可注入 System Prompt 的 Markdown 记忆块。
+
+        优先使用 retriever 已生成的 prompt_context；缺失时本地组装 L3/L2 兜底。
+        返回带 MEMORY_BLOCK_MARKER 的文本；无有效记忆时返回空串。
+        """
+        if not isinstance(result, dict):
+            return ""
+
+        text = str(result.get("prompt_context") or "").strip()
+
+        # 兜底：本地组装（不依赖 retriever 私有方法）
+        if not text:
+            pinned = result.get("pinned_l3") or []
+            retrieved = result.get("retrieved_l2") or []
+            if not pinned and not retrieved:
+                return ""
+            lines = ["## 🧠 长期记忆上下文 (Agent Memory Context)"]
+            if pinned:
+                lines.append("### 📌 核心记忆与约束 (L3 Pinned)")
+                for idx, item in enumerate(pinned, start=1):
+                    if not isinstance(item, dict):
+                        continue
+                    content = str(item.get("content", "")).strip()
+                    if not content:
+                        continue
+                    atom_type = str(item.get("atom_type", "preference"))
+                    try:
+                        importance = float(item.get("importance", 0.9))
+                    except (TypeError, ValueError):
+                        importance = 0.9
+                    lines.append(
+                        f"{idx}. **[核心/{atom_type}]** {content} *(重要度: {importance:.2f})*"
+                    )
+            if retrieved:
+                lines.append("### 🔍 相关情景记忆 (L2 Retrieved)")
+                for idx, item in enumerate(retrieved, start=1):
+                    if not isinstance(item, dict):
+                        continue
+                    content = str(item.get("content", "")).strip()
+                    if not content:
+                        continue
+                    lines.append(f"{idx}. {content}")
+            text = "\n".join(lines).strip()
+
+        if not text:
+            return ""
+
+        # 字符上限保护：避免污染过长导致挤占人格提示词
+        if max_chars and len(text) > max_chars:
+            text = text[:max_chars].rstrip() + "\n... (记忆上下文已截断)"
+
+        return f"{MEMORY_BLOCK_MARKER}\n{text}"
+
+    async def build_memory_prompt_block(
+        self, query: str, session_id: str = ""
+    ) -> str:
+        """
+        执行两阶段检索并返回可注入的 Markdown 记忆块。
+        超时 / 异常 / 空结果统一返回空串（静默降级，绝不阻塞主对话）。
+        """
+        if not self.enable_memory or self.retriever is None:
+            return ""
+
+        q = str(query or "").strip()
+        if not q:
+            return ""
+
+        rc = self._retrieval_runtime_cfg()
+        try:
+            result = await asyncio.wait_for(
+                self.retriever.retrieve(
+                    query=q,
+                    session_id=session_id or None,
+                    top_k=rc["top_k"],
+                    candidate_k=max(rc["top_k"] * 3, rc["candidate_k"]),
+                ),
+                timeout=rc["timeout"],
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[agent_memory] 前置检索超时(%.1fs)，本次跳过记忆注入。", rc["timeout"]
+            )
+            self._hook_stats["inject_error"] += 1
+            return ""
+        except Exception as exc:
+            logger.warning("[agent_memory] 前置检索异常(已降级): %s", exc)
+            self._hook_stats["inject_error"] += 1
+            return ""
+
+        return self.format_memory_block(result, rc["max_chars"])
+
+    @staticmethod
+    def _apply_block_to_request(req: Any, block: str, position: str = "head") -> bool:
+        """
+        把记忆块写入 req.system_prompt。
+        - 已含 MARKER → 视为同一请求已注入，跳过（防工具调用多轮重复注入）；
+        - position=head 前置 / tail 后置。
+        返回是否实际写入。
+        """
+        if req is None or not block:
+            return False
+        try:
+            existing = str(_safe_attr(req, "system_prompt", "") or "")
+        except Exception:
+            existing = ""
+
+        if MEMORY_BLOCK_MARKER in existing:
+            return False
+
+        if position == "tail":
+            merged = f"{existing}\n\n{block}" if existing else block
+        else:
+            merged = f"{block}\n\n{existing}" if existing else block
+
+        try:
+            req.system_prompt = merged
+            return True
+        except Exception:
+            # 少数宿主实现为只读属性：静默放弃
+            return False
+
+    async def inject_memory_into_request(self, event: Any = None, req: Any = None) -> bool:
+        """
+        前置钩子核心：抽取 Query → 检索 → 注入 System Prompt。
+        全量 try-except，任何异常都不影响 AstrBot 正常对话流。
+        """
+        try:
+            if not self.enable_memory or not self.enable_injection or req is None:
+                self._hook_stats["inject_skip"] += 1
+                return False
+
+            query = _extract_user_query(event, req)
+            if not query:
+                self._hook_stats["inject_skip"] += 1
+                return False
+
+            session_id = _extract_session_id(event, req)
+            rc = self._retrieval_runtime_cfg()
+            block = await self.build_memory_prompt_block(query, session_id)
+            if not block:
+                self._hook_stats["inject_skip"] += 1
+                return False
+
+            ok = self._apply_block_to_request(req, block, rc["position"])
+            if ok:
+                self._hook_stats["inject_ok"] += 1
+                logger.debug(
+                    "[agent_memory] 已注入记忆块 | session=%s | chars=%d | position=%s",
+                    session_id,
+                    len(block),
+                    rc["position"],
+                )
+            else:
+                self._hook_stats["inject_skip"] += 1
+            return ok
+        except Exception as exc:  # 钩子内绝不抛出
+            self._hook_stats["inject_error"] += 1
+            logger.warning("[agent_memory] 注入钩子异常(已忽略): %s", exc)
+            return False
+
+    # ------------------------------------------------------------------
+    # Stage 2 核心二：后置轮次记录（Turn Record）
+    # ------------------------------------------------------------------
+    def _should_skip_record(self, session_id: str, fingerprint: tuple) -> bool:
+        """短窗口去重：同一会话相同内容在窗口内只记一次，抵御宿主重复回调。"""
+        window = _safe_float(
+            self._section("retrieval").get("record_dedup_window"),
+            DEFAULT_RECORD_DEDUP_WINDOW,
+        )
+        last = self._last_recorded.get(session_id)
+        if not last:
+            return False
+        last_fp, last_ts = last
+        if last_fp != fingerprint:
+            return False
+        try:
+            return (time.monotonic() - float(last_ts)) <= window
+        except Exception:
+            return False
+
+    async def capture_turn_from_response(
+        self, event: Any = None, resp: Any = None, bot_text_override: str = ""
+    ) -> bool:
+        """
+        后置钩子核心：抽取「用户输入 + Assistant 回复」→ 推入多轮缓冲池。
+
+        过滤规则：
+        - resp.is_chunk=True：流式分片，跳过（等最终完整响应）；
+        - resp.tools_call_name 非空：工具调用轮，跳过（等最终自然语言回复）。
+        """
+        try:
+            if not self.enable_memory or self.summarizer is None:
+                self._hook_stats["record_skip"] += 1
+                return False
+
+            if resp is not None:
+                if bool(_safe_attr(resp, "is_chunk", False)):
+                    self._hook_stats["record_skip"] += 1
+                    return False
+                if _safe_attr(resp, "tools_call_name", None):
+                    self._hook_stats["record_skip"] += 1
+                    return False
+
+            session_id = _extract_session_id(event, None)
+            user_text = _extract_user_query(event, None)
+            bot_text = str(bot_text_override or "").strip() or _extract_assistant_text(resp)
+
+            if not session_id or (not user_text and not bot_text):
+                self._hook_stats["record_skip"] += 1
+                return False
+
+            fingerprint = (user_text, bot_text)
+            if self._should_skip_record(session_id, fingerprint):
+                self._hook_stats["record_skip"] += 1
+                logger.debug("[agent_memory] 轮次重复回调已忽略 | session=%s", session_id)
+                return False
+
+            # record_turn 内部为纯内存缓冲（零 IO），await 不会阻塞对话链路
+            ok = await self.record_turn(session_id, user_text, bot_text)
+            if ok:
+                self._hook_stats["record_ok"] += 1
+                self._last_recorded[session_id] = (fingerprint, time.monotonic())
+                logger.debug(
+                    "[agent_memory] 已记录 1 轮 | session=%s | user=%.20s | bot=%.20s",
+                    session_id,
+                    user_text,
+                    bot_text,
+                )
+            else:
+                self._hook_stats["record_skip"] += 1
+            return ok
+        except Exception as exc:  # 钩子内绝不抛出
+            self._hook_stats["record_error"] += 1
+            logger.warning("[agent_memory] 轮次记录钩子异常(已忽略): %s", exc)
+            return False
+
+    # ------------------------------------------------------------------
+    # Stage 2 钩子装配：双向拦截
+    # 1) on_llm_request       → 前置记忆注入（写 req.system_prompt）
+    # 2) on_llm_response      → 后置轮次记录（读 resp.completion_text）
+    # 3) on_decorating_result → 仅在缺少 on_llm_response 时作为兜底记录点
+    # 说明：三者均按宿主能力逐个装配，任一缺失不影响插件加载；
+    #      钩子内部全量 try-except，异常绝不外抛污染主对话链路。
+    # ------------------------------------------------------------------
+    if _ON_LLM_REQUEST is not None:  # pragma: no branch
+
+        @_ON_LLM_REQUEST()  # type: ignore[misc]
+        async def on_llm_request(self, event: Any = None, req: Any = None) -> None:
+            """LLM 请求前置：检索分层记忆并注入 System Prompt 前部。"""
+            await self.inject_memory_into_request(event, req)
+
     if _ON_LLM_RESPONSE is not None:  # pragma: no branch
 
         @_ON_LLM_RESPONSE()  # type: ignore[misc]
-        async def on_llm_response(self, event: Any, resp: Any) -> None:
-            """LLM 回复完成后回调：异常绝不外抛，确保不影响主对话链路。"""
+        async def on_llm_response(self, event: Any = None, resp: Any = None) -> None:
+            """LLM 响应后置：把「用户输入 + 机器人回复」写入轮次缓冲池。"""
+            await self.capture_turn_from_response(event, resp)
+
+    elif _ON_DECORATING_RESULT is not None:  # pragma: no cover - 兜底分支
+
+        @_ON_DECORATING_RESULT()  # type: ignore[misc]
+        async def on_decorating_result(self, event: Any = None) -> None:
+            """
+            兜底：宿主未提供 on_llm_response 时，从待发送消息链中取纯文本记录轮次。
+            """
             try:
-                if not self.enable_memory:
+                bot_text = _extract_text_from_event_result(event)
+                if not bot_text:
                     return
-
-                # 会话标识：优先 unified_msg_origin，其次 session_id
-                session_id = _first_non_empty(
-                    getattr(event, "unified_msg_origin", None),
-                    getattr(event, "session_id", None),
-                    default="",
+                await self.capture_turn_from_response(
+                    event, None, bot_text_override=bot_text
                 )
-                user_text = _first_non_empty(
-                    getattr(event, "message_str", None),
-                    getattr(event, "message_text", None),
-                    default="",
+            except Exception as exc:  # pragma: no cover
+                self._hook_stats["record_error"] += 1
+                logger.warning(
+                    "[agent_memory] on_decorating_result 兜底钩子异常(已忽略): %s", exc
                 )
-                bot_text = _first_non_empty(
-                    getattr(resp, "completion_text", None),
-                    getattr(resp, "completion", None),
-                    getattr(resp, "text", None),
-                    default="",
-                )
-                if not session_id or (not user_text and not bot_text):
-                    return
-
-                await self.record_turn(str(session_id), str(user_text), str(bot_text))
-            except Exception as exc:  # pragma: no cover - 钩子内绝不抛出
-                logger.warning("[agent_memory] on_llm_response 钩子异常(已忽略): %s", exc)

@@ -17,6 +17,12 @@
     "default": 5,
     "hint": "同一会话累积 N 轮对话后才打包触发一次后台总结，减少 LLM 调用；会话结束或插件关闭时会强制冲洗剩余轮次"
   },
+  "memory_injection_enable": {
+    "description": "启用记忆前置注入（Prompt Injection）",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后 LLM 请求不再被注入长期记忆，但轮次沉淀（后置记录）仍然生效"
+  },
   "summarizer_queue_maxsize": {
     "description": "后台总结队列最大容量",
     "type": "int",
@@ -157,12 +163,36 @@
       "weight_bm25": {
         "description": "BM25 关键词检索权重",
         "type": "float",
-        "default": 0.30
+        "default": 0.3
       },
       "weight_importance": {
         "description": "重要度与时间衰减权重",
         "type": "float",
         "default": 0.15
+      },
+      "retrieve_timeout": {
+        "description": "前置检索最大等待时长（秒）",
+        "type": "float",
+        "default": 3.0,
+        "hint": "超时即静默降级跳过本次注入，绝不拖慢主对话链路"
+      },
+      "prompt_injection_max_chars": {
+        "description": "注入 System Prompt 的记忆块字符上限",
+        "type": "int",
+        "default": 2000,
+        "hint": "0 表示不限制；超长会被截断，避免挤占人格提示词"
+      },
+      "inject_position": {
+        "description": "记忆块注入位置",
+        "type": "string",
+        "default": "head",
+        "hint": "head=System Prompt 前部（推荐）；tail=尾部"
+      },
+      "record_dedup_window": {
+        "description": "轮次记录去重时间窗（秒）",
+        "type": "float",
+        "default": 2.0,
+        "hint": "同一会话相同内容在该窗口内只记录一次，抵御宿主重复回调"
       }
     }
   },
