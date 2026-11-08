@@ -15,6 +15,7 @@ import inspect
 import json
 import logging
 import math
+import re
 import sqlite3
 import struct
 import time
@@ -50,6 +51,18 @@ except ImportError:
         from .storage import MemoryStorage as StorageManager
     except ImportError:  # pragma: no cover
         from storage import MemoryStorage as StorageManager  # type: ignore
+
+# 方案 C：图谱扩展列幂等补齐工具
+try:
+    from .storage import ensure_kg_columns as _ensure_kg_columns
+except ImportError:  # pragma: no cover
+    try:
+        from storage import ensure_kg_columns as _ensure_kg_columns  # type: ignore
+    except ImportError:
+
+        def _ensure_kg_columns(conn: sqlite3.Connection) -> bool:  # type: ignore
+            """存储层不可用时的空实现（图谱召回自动降级）。"""
+            return False
 
 
 def _unpack_embedding(blob: Any) -> List[float]:
@@ -95,6 +108,9 @@ _POOL_COLUMNS: Tuple[str, ...] = (
     "status",
     "superseded_by",
     "superseded_at",
+    # 方案 C：时间衰减所需字段
+    "ttl_days",
+    "decay_type",
 )
 
 
@@ -163,6 +179,46 @@ class MemoryRetriever:
         self._stat_access_buffered: int = 0
         self._stat_access_flushed: int = 0
 
+        # ---- 方案 C-1：L3 知识图谱 1-hop 关联召回开关 ----
+        self.graph_recall_enabled: bool = bool(self.config.get("graph_recall_enabled", True))
+        try:
+            self.graph_entity_limit: int = max(
+                1, int(self.config.get("graph_entity_limit", 5) or 5)
+            )
+        except (TypeError, ValueError):
+            self.graph_entity_limit = 5
+        try:
+            self.graph_edge_limit: int = max(
+                1, int(self.config.get("graph_edge_limit", 20) or 20)
+            )
+        except (TypeError, ValueError):
+            self.graph_edge_limit = 20
+        try:
+            self.graph_score_bonus: float = max(
+                0.0, float(self.config.get("graph_score_bonus", 0.15) or 0.0)
+            )
+        except (TypeError, ValueError):
+            self.graph_score_bonus = 0.15
+        self._kg_schema_ready: bool = False
+        # 可观测性统计
+        self._stat_graph_recalls: int = 0
+
+        # ---- 方案 C-2：艾宾浩斯时间衰减曲线 ----
+        try:
+            self.decay_lambda: float = max(
+                0.0, float(self.config.get("decay_lambda", 1.0) or 0.0)
+            )
+        except (TypeError, ValueError):
+            self.decay_lambda = 1.0
+        self.decay_enabled: bool = bool(self.config.get("decay_enabled", True))
+        # 衰减下限：防止久远记忆被压到 0 后彻底失去召回机会（可配置为 0 关闭）
+        try:
+            self.decay_floor: float = min(
+                1.0, max(0.0, float(self.config.get("decay_floor", 0.05) or 0.0))
+            )
+        except (TypeError, ValueError):
+            self.decay_floor = 0.05
+
     def _strict_isolation(self) -> bool:
         """
         R-04：是否开启严格会话隔离（默认 True）。
@@ -198,6 +254,243 @@ class MemoryRetriever:
             self._schema_checked = True
         except Exception as exc:
             logger.warning("[MemoryRetriever] 检查扩展列异常: %s", exc)
+
+    # ------------------------------------------------------------------
+    # 方案 C-1：L3 时序知识图谱 1-hop 关联子图召回
+    # ------------------------------------------------------------------
+    def _ensure_kg_schema(self, conn: sqlite3.Connection) -> None:
+        """幂等补齐图谱扩展列（仅首次执行，失败自动降级为无图谱召回）。"""
+        if self._kg_schema_ready:
+            return
+        self._kg_schema_ready = True
+        try:
+            _ensure_kg_columns(conn)
+        except Exception as exc:  # pragma: no cover - 结构异常极罕见
+            logger.debug("[MemoryRetriever] 图谱扩展列补齐失败（降级）: %s", exc)
+
+    @staticmethod
+    def _query_entity_terms(query: str) -> List[str]:
+        """
+        从 query 中提取用于图谱实体匹配的候选词。
+
+        策略：分词后取「长度 >= 2」的词元，并额外补充 CJK 双字/三字滑窗，
+        提升「美式咖啡」这类未登录实体在子串匹配中的命中率。
+        """
+        text = str(query or "").strip()
+        if not text:
+            return []
+        terms: List[str] = []
+        seen: set[str] = set()
+
+        def _push(token: str) -> None:
+            tok = token.strip()
+            if len(tok) >= 2 and tok not in seen:
+                seen.add(tok)
+                terms.append(tok)
+
+        try:
+            for token in _tokenize_for_similarity(text):
+                _push(token)
+        except Exception:  # pragma: no cover - 分词器异常兜底
+            pass
+
+        cjk_runs = re.findall(r"[\u4e00-\u9fff]+", text)
+        for run in cjk_runs:
+            if 2 <= len(run) <= 8:
+                _push(run)
+            # 三字优先滑窗（实体多为 2~4 字），避免窗口爆炸
+            for size in (3, 2):
+                if len(run) > size:
+                    for i in range(len(run) - size + 1):
+                        _push(run[i : i + size])
+        return terms[:16]
+
+    def _graph_subgraph_recall(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        session_id: Optional[str] = None,
+    ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        基于 query 命中的实体做 1-hop 关联子图召回。
+
+        :return: ``(atom_map, explanations)``
+                 - atom_map: ``{atom_id: {"score": float, "explain": str}}``，
+                   score 已按边权归一化到 (0, 1]，供粗排阶段作为关联加分；
+                 - explanations: 人类可读的多跳关联解释列表。
+        """
+        if not self.graph_recall_enabled:
+            return {}, []
+        if not hasattr(self.storage, "expand_kg_subgraph"):
+            return {}, []
+
+        terms = self._query_entity_terms(query)
+        if not terms:
+            return {}, []
+
+        try:
+            self._ensure_kg_schema(conn)
+            scope = str(session_id or "global").strip() or "global"
+            edges = self.storage.expand_kg_subgraph(
+                scope_key=scope,
+                query_terms=terms,
+                max_entities=self.graph_entity_limit,
+                max_edges=self.graph_edge_limit,
+                include_global=True,
+                # 关闭严格隔离时才允许跨作用域图谱召回（R-04 语义一致）
+                all_scopes=not self._strict_isolation(),
+            )
+        except Exception as exc:
+            logger.debug("[MemoryRetriever] 图谱子图召回失败（降级）: %s", exc)
+            return {}, []
+
+        if not edges:
+            return {}, []
+
+        max_weight = max((float(e.get("weight") or 1.0) for e in edges), default=1.0)
+        atom_map: Dict[str, Dict[str, Any]] = {}
+        explanations: List[Dict[str, Any]] = []
+        for edge in edges:
+            atom_id = str(edge.get("atom_id") or "").strip()
+            weight = float(edge.get("weight") or 1.0)
+            confidence = float(edge.get("confidence") or 1.0)
+            # 归一化边权 → 关联得分：0.5 基础 + 0.5 相对权重，乘置信度
+            rel_score = (0.5 + 0.5 * max(0.0, weight / max_weight)) * min(1.0, max(0.0, confidence))
+            explain = (
+                f"{edge.get('entity')} --[{edge.get('relation')}]--> {edge.get('neighbor')}"
+                if edge.get("direction") == "out"
+                else f"{edge.get('neighbor')} --[{edge.get('relation')}]--> {edge.get('entity')}"
+            )
+            explanations.append(
+                {
+                    "atom_id": atom_id,
+                    "entity": str(edge.get("entity") or ""),
+                    "neighbor": str(edge.get("neighbor") or ""),
+                    "relation": str(edge.get("relation") or ""),
+                    "weight": weight,
+                    "explain": explain,
+                }
+            )
+            if not atom_id:
+                continue
+            prev = atom_map.get(atom_id)
+            if prev is None or rel_score > prev["score"]:
+                atom_map[atom_id] = {"score": round(rel_score, 4), "explain": explain}
+
+        if atom_map:
+            self._stat_graph_recalls += 1
+            logger.debug(
+                "[MemoryRetriever] 图谱 1-hop 召回 entities=%d atoms=%d",
+                len({e.get('entity') for e in edges}),
+                len(atom_map),
+            )
+        return atom_map, explanations
+
+    def _fetch_atoms_by_ids(
+        self,
+        conn: sqlite3.Connection,
+        atom_ids: Sequence[str],
+        session_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        按 atom_id 批量拉取仍有效的记忆原子（用于图谱召回补充候选池）。
+
+        严格遵守 R-04 会话隔离：非 global 记忆必须属于当前会话。
+        """
+        ids = [str(a) for a in (atom_ids or []) if str(a or "").strip()]
+        if not ids:
+            return []
+        atoms: List[Dict[str, Any]] = []
+        try:
+            ph = ",".join("?" for _ in ids)
+            col_sql = self._pool_column_sql(conn, with_embedding=False)
+            sql = f"""
+                SELECT {col_sql}
+                FROM l2_atoms
+                WHERE atom_id IN ({ph})
+                  AND COALESCE(status, 'active') != 'superseded'
+            """
+            params: List[Any] = list(ids)
+            if self._strict_isolation():
+                clean_sid = str(session_id or "").strip()
+                if clean_sid:
+                    sql += """
+                      AND (
+                            scope_key = ?
+                            OR session_id = ?
+                            OR COALESCE(scope_key, '') = 'global'
+                          )
+                    """
+                    params.extend([clean_sid, clean_sid])
+                else:
+                    sql += " AND COALESCE(scope_key, '') = 'global'"
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            for row in rows:
+                item = self._row_to_atom_dict(row)
+                if item.get("content"):
+                    atoms.append(item)
+        except Exception as exc:
+            logger.debug("[MemoryRetriever] 图谱候选原子拉取失败（降级）: %s", exc)
+        return atoms
+
+    # ------------------------------------------------------------------
+    # 方案 C-2：艾宾浩斯时间衰减曲线
+    # ------------------------------------------------------------------
+    def _time_decay_factor(
+        self, atom: Dict[str, Any], now: Optional[float] = None
+    ) -> float:
+        """
+        计算单条记忆的时间衰减系数 ∈ [decay_floor, 1.0]。
+
+        公式（指数型，默认）：
+            factor = exp(-lambda * Δt_days / ttl_days)
+
+        - ``pinned=1`` 或 ``tier>=3`` 的 L3 置顶核心记忆：恒为 1.0（免死金牌的时间维度贯彻）；
+        - ``decay_type='none'/'static'``：恒为 1.0（不衰减）；
+        - ``decay_type='linear'``：factor = max(0, 1 - Δt/ttl)；
+        - 其余（'exponential' 默认）：exp 曲线，并按 ``decay_floor`` 兜底。
+        """
+        if not self.decay_enabled:
+            return 1.0
+        try:
+            if int(atom.get("pinned") or 0) == 1 or int(atom.get("tier") or 0) >= 3:
+                return 1.0
+        except (TypeError, ValueError):
+            pass
+
+        decay_type = str(atom.get("decay_type") or "exponential").strip().lower()
+        if decay_type in ("none", "static", "off", "disabled"):
+            return 1.0
+
+        try:
+            ttl_days = float(atom.get("ttl_days") or 30.0)
+        except (TypeError, ValueError):
+            ttl_days = 30.0
+        if ttl_days <= 0:
+            ttl_days = 30.0
+
+        reference = float(
+            atom.get("updated_at")
+            or atom.get("last_accessed_at")
+            or atom.get("created_at")
+            or 0.0
+        )
+        if reference <= 0:
+            return 1.0
+        current = float(now if now is not None else time.time())
+        delta_days = max(0.0, (current - reference) / 86400.0)
+        if delta_days <= 0:
+            return 1.0
+
+        ratio = delta_days / ttl_days
+        try:
+            if decay_type == "linear":
+                factor = 1.0 - ratio
+            else:
+                factor = math.exp(-self.decay_lambda * ratio)
+        except (OverflowError, ValueError):  # pragma: no cover - 极端数值兜底
+            factor = self.decay_floor
+        return max(self.decay_floor, min(1.0, float(factor)))
 
     # ------------------------------------------------------------------
     # 方案 B：工业级引擎懒初始化（FTS5 + 向量矩阵缓存）
@@ -308,6 +601,9 @@ class MemoryRetriever:
             "topics": topics,
             "created_at": float(_get("created_at", 0.0)),
             "updated_at": float(_get("updated_at", 0.0)),
+            # 方案 C：时间衰减所需字段（旧库缺失时安全回退默认值）
+            "ttl_days": float(_get("ttl_days", 30.0) or 30.0),
+            "decay_type": str(_get("decay_type", "exponential") or "exponential"),
             "_embedding": _unpack_embedding(_get("embedding_blob", None)),
         }
 
@@ -517,6 +813,7 @@ class MemoryRetriever:
         pinned_contents: set[str],
         candidate_k: int = 20,
         fts_scores: Optional[Dict[str, float]] = None,
+        graph_scores: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[float]]:
         """
         步骤 2：第一阶段粗排召回（First-Stage Recall）
@@ -619,10 +916,27 @@ class MemoryRetriever:
         for rank, idx in enumerate(kw_order):
             merged_indices[idx] = merged_indices.get(idx, 0.0) + 0.45 * kw_scores[idx] + (0.1 / (rank + 1))
 
+        # 6.1 方案 C-1：图谱 1-hop 关联加分（多跳召回的记忆即使向量/关键词双弱也能进候选）
+        graph_score_by_idx: Dict[int, float] = {}
+        if graph_scores:
+            for idx in range(n_pool):
+                aid = str(filtered_pool[idx].get("atom_id", ""))
+                graph_hit = graph_scores.get(aid)
+                if not graph_hit:
+                    continue
+                g_score = float(graph_hit.get("score", 0.0) or 0.0)
+                if g_score <= 0:
+                    continue
+                graph_score_by_idx[idx] = g_score
+                merged_indices[idx] = (
+                    merged_indices.get(idx, 0.0) + self.graph_score_bonus * g_score
+                )
+
         sorted_candidate_indices = sorted(
             merged_indices.keys(),
             key=lambda idx: (
                 merged_indices[idx],
+                float(graph_score_by_idx.get(idx, 0.0)),
                 float(filtered_pool[idx].get("importance", 0.5)),
                 float(filtered_pool[idx].get("updated_at", 0.0)),
             ),
@@ -646,6 +960,13 @@ class MemoryRetriever:
             atom_copy["coarse_vector_score"] = round(vec_scores[idx], 4)
             atom_copy["coarse_keyword_score"] = round(kw_scores[idx], 4)
             atom_copy["coarse_score"] = round(merged_indices[idx], 4)
+            # 方案 C-1：透传图谱关联命中信息，供精排解释与前端展示
+            if idx in graph_score_by_idx:
+                aid = str(atom_copy.get("atom_id", ""))
+                graph_hit = (graph_scores or {}).get(aid, {})
+                atom_copy["graph_hit"] = True
+                atom_copy["graph_score"] = graph_score_by_idx[idx]
+                atom_copy["graph_explain"] = str(graph_hit.get("explain", ""))
             candidates.append(atom_copy)
 
         return candidates, query_vec
@@ -656,6 +977,7 @@ class MemoryRetriever:
         candidates: List[Dict[str, Any]],
         query_vec: Sequence[float],
         top_k: int = 5,
+        now: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """
         步骤 3：第二阶段精排重排序（Second-Stage Rerank）
@@ -723,6 +1045,7 @@ class MemoryRetriever:
                 used_indices.add(target_idx)
                 selected = dict(candidates[target_idx])
                 selected.pop("_embedding", None)
+                selected["base_score"] = round(score, 6)
                 selected["relevance_score"] = round(score, 6)
                 selected["source_tier"] = "L2"
                 retrieved_l2.append(selected)
@@ -736,9 +1059,34 @@ class MemoryRetriever:
                     continue
                 selected = dict(cand)
                 selected.pop("_embedding", None)
-                selected["relevance_score"] = round(float(selected.get("coarse_score", 0.0)), 6)
+                base = round(float(selected.get("coarse_score", 0.0)), 6)
+                selected["base_score"] = base
+                selected["relevance_score"] = base
                 selected["source_tier"] = "L2"
                 retrieved_l2.append(selected)
+
+        # ---- 方案 C-2：艾宾浩斯时间衰减（精排最终打分阶段）----
+        # Score_decayed = Score_base × exp(-λ · Δt / ttl_days)
+        # pinned=1 / tier>=3 的 L3 置顶记忆恒为 1.0（永不衰减）。
+        current = float(now if now is not None else time.time())
+        for item in retrieved_l2:
+            try:
+                base_score = float(item.get("base_score", item.get("relevance_score", 0.0)))
+                factor = self._time_decay_factor(item, now=current)
+                item["decay_factor"] = round(factor, 6)
+                item["relevance_score"] = round(base_score * factor, 6)
+            except Exception:  # pragma: no cover - 单条异常不影响整体
+                item.setdefault("decay_factor", 1.0)
+
+        # 衰减后重排：陈旧琐事自然让位于新鲜上下文
+        retrieved_l2.sort(
+            key=lambda x: (
+                float(x.get("relevance_score", 0.0)),
+                float(x.get("importance", 0.0)),
+                float(x.get("updated_at", 0.0)),
+            ),
+            reverse=True,
+        )
 
         return retrieved_l2[: int(top_k)]
 
@@ -893,8 +1241,10 @@ class MemoryRetriever:
                 if not content:
                     continue
                 rel_score = float(item.get("relevance_score", 0.0))
+                graph_explain = str(item.get("graph_explain") or "").strip()
+                suffix = f" / 图谱关联: `{graph_explain}`" if graph_explain else ""
                 l2_lines.append(
-                    f"- {content} *(相关度: {rel_score:.4f})*"
+                    f"- {content} *(相关度: {rel_score:.4f}{suffix})*"
                 )
             if len(l2_lines) > 1:
                 sections.append("\n".join(l2_lines))
@@ -943,6 +1293,7 @@ class MemoryRetriever:
                     "pinned_l3": pinned_l3,
                     "retrieved_l2": [],
                     "prompt_context": prompt_context,
+                    "graph_explanations": [],
                 }
 
             # 2. 第一阶段粗排召回
@@ -958,6 +1309,38 @@ class MemoryRetriever:
                 with_embedding=not matrix_usable,
             )
 
+            # 方案 C-1：L3 知识图谱 1-hop 关联子图召回（补充候选池，赋予多跳解释能力）
+            graph_scores: Dict[str, Dict[str, Any]] = {}
+            graph_explanations: List[Dict[str, Any]] = []
+            try:
+                graph_scores, graph_explanations = self._graph_subgraph_recall(
+                    conn=conn,
+                    query=clean_query,
+                    session_id=session_id,
+                )
+                if graph_scores:
+                    pool_ids = {str(a.get("atom_id", "")) for a in l2_pool}
+                    missing_ids = [
+                        aid for aid in graph_scores.keys() if aid and aid not in pool_ids
+                    ]
+                    if missing_ids:
+                        extra_atoms = self._fetch_atoms_by_ids(
+                            conn=conn, atom_ids=missing_ids, session_id=session_id
+                        )
+                        # 图谱召回补充项需排除已在 L3 置顶集合中的重复项
+                        for atom in extra_atoms:
+                            if str(atom.get("atom_id", "")) in pinned_ids:
+                                continue
+                            l2_pool.append(atom)
+                    logger.debug(
+                        "[MemoryRetriever] 图谱召回注入 atoms=%d total_pool=%d",
+                        len(graph_scores),
+                        len(l2_pool),
+                    )
+            except Exception as graph_exc:  # pragma: no cover - 双保险降级
+                logger.debug("[MemoryRetriever] 图谱召回异常（降级为无图谱）: %s", graph_exc)
+                graph_scores, graph_explanations = {}, []
+
             # 方案 B-1：优先走 FTS5 倒排 MATCH + bm25；无命中则回退 Python BM25
             fts_scores = self._fts_keyword_scores(
                 conn=conn,
@@ -972,9 +1355,10 @@ class MemoryRetriever:
                 pinned_contents=pinned_contents,
                 candidate_k=effective_candidate_k,
                 fts_scores=fts_scores or None,
+                graph_scores=graph_scores or None,
             )
 
-            # 3. 第二阶段精排重排序
+            # 3. 第二阶段精排重排序（含方案 C-2 时间衰减）
             retrieved_l2 = await self._second_stage_rerank(
                 query=clean_query,
                 candidates=candidates,
@@ -993,6 +1377,7 @@ class MemoryRetriever:
                 "pinned_l3": pinned_l3,
                 "retrieved_l2": retrieved_l2,
                 "prompt_context": prompt_context,
+                "graph_explanations": graph_explanations,
             }
         except Exception as exc:
             logger.error(

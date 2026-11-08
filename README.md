@@ -27,11 +27,12 @@
 | [源流与致敬](#origin) | 我们继承了谁、又砍掉了什么 |
 | [生产级超越](#plan-a) | 方案 A 的五道硬核防线 |
 | [工业级引擎升级](#plan-b) | 方案 B：FTS5 倒排 + 向量矩阵缓存 + 死信闭环 |
+| [时序知识图谱](#plan-c) | 方案 C：知识图谱 1-hop 关联 + 艾宾浩斯时间衰减 |
 | [30 秒快速上手](#quickstart) | 复制粘贴就能跑 |
 | [架构对比](#compare) | 轻量化到底轻到什么程度 |
 | [配置说明](#config) | 兼容任意模型 / 本地 Embedding |
-| [测试与质量](#tests) | 63 个用例锁死的行为契约 |
-| [开源演进路线图](#roadmap) | 已落地阶段 + 方案 C 要做什么 |
+| [测试与质量](#tests) | 75 个用例锁死的行为契约 |
+| [开源演进路线图](#roadmap) | 已落地阶段 + 下一步要做什么 |
 | [English TL;DR](#english) | 英文速览 |
 
 <a id="english"></a>
@@ -44,7 +45,7 @@
 - **Rebuilt for humans**: the original needs 4 Docker containers, Node.js 22 and a dedicated vector database (multi-GB). Ours is **one SQLite file, ~30 MB RAM, zero infrastructure**.
 - **Production hardened (Plan A)**: pinned memories can never be killed by a confused LLM, 5 dialogue turns collapse into a single batched LLM + embedding call (**≈80% cheaper**), every turn is persisted immediately, sessions are strictly isolated, and retrieval is lock-free read-only.
 - **Plan B landed (industrial engine)**: native SQLite `FTS5` inverted index with CJK pre-tokenization (≈13x faster keyword recall), an in-memory **vector matrix cache** (`matrix @ query`, microsecond vector scoring, auto-fallback to pure Python), and a **closed-loop dead-letter queue** with exponential backoff retries.
-- **Roadmap**: Plan C — a true temporal knowledge graph.
+- **Plan C landed (temporal knowledge graph)**: real `kg_nodes` / `kg_edges` write path with entity triples, **1-hop subgraph recall** for multi-hop explanations, and an **Ebbinghaus time-decay curve** (`exp(-λ·Δt/ttl)`) where `pinned=1` L3 memories never decay.
 
 > 中文读者请继续往下读，下面全部是中文主线，穿插英文术语便于检索。
 
@@ -597,7 +598,7 @@ pip install numpy      # 可选，向量运算加速（缺失时自动回退纯 
 
 ## 🧪 测试与质量保障
 
-**7 个套件 · 63 个用例 · 全部可脱离宿主独立运行**（内置宿主桩包，零外部依赖）。
+**8 个套件 · 75 个用例 · 全部可脱离宿主独立运行**（内置宿主桩包，零外部依赖）。
 
 ```bash
 python3 tests/test_stage1_buffer.py          # 多轮缓冲打包 / 强制冲洗 / Worker 消费
@@ -607,6 +608,7 @@ python3 tests/test_stage4_e2e.py             # 全链路端到端闭环 + 冷重
 python3 tests/test_stage5_evaluator_gate.py  # 判官门禁：价值打分 / 冲突废弃 / 超时降级
 python3 tests/test_stage6_hardening.py       # 方案 A 防线：R-01 ~ R-06 六项专项
 python3 tests/test_stage7_engine_b.py        # 方案 B 引擎：FTS5 / 向量矩阵 / DLQ 闭环 22 项专项
+python3 tests/test_stage8_graph_c.py         # 方案 C 图谱：三元组落库 / 1-hop 召回 / 时间衰减 12 项专项
 ```
 
 > 全量回归同时兼容 **numpy 存在 / 缺失** 两种运行环境（矩阵缓存自动切换后端），
@@ -657,6 +659,7 @@ python3 tests/test_stage7_engine_b.py        # 方案 B 引擎：FTS5 / 向量�
 | **Stage 5** | 判官门禁 | 廉价判官 `jev`、价值打分、冲突软废弃 |
 | **方案 A** | 生产级加固 | R-01 ~ R-06：置顶免死、真批量、实时落盘、严格隔离、连接池、纯读检索 |
 | **Stage 7 / 方案 B** | 工业级引擎 | FTS5 倒排索引（中文预分词 + 四类同步触发器）、内存向量矩阵缓存、死信队列闭环重试 |
+| **Stage 8 / 方案 C** | 时序知识图谱 | 三元组自动抽取写入 `kg_nodes`/`kg_edges`、1-hop 关联子图召回、艾宾浩斯时间衰减曲线（`pinned=1` 永不衰减） |
 
 ### ✅ 方案 B：原生 SQLite FTS5 引擎（已落地）
 
@@ -682,41 +685,77 @@ CREATE VIRTUAL TABLE l2_atoms_fts USING fts5(
 > **实测收益**：关键词召回约 **13x 加速**，向量召回从「全表反序列化 + 逐条余弦」降为**一次矩阵乘法**，
 > 且依然是**零容器、单文件、零额外依赖**。
 
-### 🔮 方案 C：真·时序知识图谱（再下一步）
+### ✅ 方案 C：真·L3 时序知识图谱 + 艾宾浩斯衰减（已落地）
 
-**要解决的问题**：现在的记忆是「一堆独立事实原子」，缺少**事实之间的关系**和**时间维度**。
-这两样东西缺失，就答不了这类问题：
+<a id="plan-c"></a>
 
-- 「主人和小李是什么关系？」
-- 「主人上个月喜欢喝美式，这个月改喜欢龙井了——哪个是现在的？」
+**解决的问题**：改造前 `kg_nodes` / `kg_edges` 是两张**僵尸表**——schema 建好了、迁移映射写好了，
+但运行期从不写入、也从不读取。同时 `ttl_days` / `decay_type` / `pinned` 三个字段躺在数据库里形同虚设。
 
-**基础设施已经预留好了**（`kg_nodes` / `kg_edges` 表结构已建，运行期待接线）：
+**Stage 8 交付**（`tests/test_stage8_graph_c.py`，12 个用例，全量回归零破坏）：
+
+#### C-1 图谱读写闭环（彻底消灭僵尸表）
+
+总结阶段在事实抽取时自动产出实体三元组，并真正落库：
 
 ```text
-                    ┌──────────────┐
-                    │   主人 (人)   │
+                    ┌──────────────┐  mention_count=3
+                    │   主人 (人)   │  last_seen_at=...
                     └──────┬───────┘
               ┌────────────┼────────────┐
-              │ 喜欢(2026-09)│            │ 认识(2025-03)
+       偏好(weight=2)  居住于(weight=1)  厌恶(weight=1)
               ▼            ▼            ▼
         ┌─────────┐  ┌─────────┐  ┌─────────┐
-        │  美式    │  │  龙井    │  │  小李    │
+        │ 美式咖啡 │  │  苏州    │  │  香菜    │
         └─────────┘  └─────────┘  └─────────┘
-          ↑ 已过期      ↑ 当前有效
+           ▲ atom_id 回指            ▲ atom_id 回指
 ```
 
-- **时序边（temporal edges）**：每条关系带 `valid_from` / `valid_to`，不再需要把旧事实删掉；
-- **冲突自动收敛**：「美式」的边被标记 `valid_to = now`，检索时只返回"当前有效"的事实；
-- **多跳推理**：支持「主人 → 同事 → 小李」这类 1~2 跳查询，回答"关系型"问题；
-- **时间旅行查询**：能回答「三个月前主人喜欢喝什么」。
+- **抽取双通道**：模型若返回结构化 `triples` 直接采纳；否则走轻量规则（10 类关系：偏好 / 厌恶 /
+  居住于 / 名为 / 职业为 / 生日为 / 工号为 / 拥有 / 使用 / 工作于），零依赖、可解释、疑问句零误抽；
+- **节点增强**：实体按 `(scope_key, entity_name, entity_type)` 去重，`mention_count` 累加、`last_seen_at` 刷新；
+- **边增强**：按 `(scope, source, target, relation_type, atom_id)` 去重，`weight` / `reinforcement_count` 累加，
+  并回指 `atom_id`，实现「记忆原子 ↔ 图谱关系」双向可追溯；
+- **1-hop 关联召回**：`retriever` 在粗排前以 query 命中的实体为种子，沿活跃 `kg_edges` 召回 1-hop 关联记忆，
+  注入候选池并附 `graph_explain` 多跳解释（如 `主人 --[偏好]--> 美式咖啡`），同时严格遵守 R-04 会话隔离；
+- **软废弃联动**：原子被判官标记 `superseded` 时，其关联边同步 `status='invalidated'`、`weight=0`、
+  记录 `invalidated_at`，**不物理删除**（可追溯），且失效边不再参与 1-hop 召回。
+
+#### C-2 艾宾浩斯时间衰减曲线
+
+精排最终打分阶段引入真实时间衰减：
+
+```text
+Score_decayed = Score_base × exp(-λ · Δt_days / ttl_days)
+```
+
+- **`pinned=1` / `tier>=3` 的 L3 核心记忆衰减系数恒为 1.0** —— 免死金牌从「冲突维度」延续到「时间维度」；
+- 普通 L2 记忆按 `decay_type` 分支：`exponential`（默认）/ `linear` / `none`，并受 `decay_floor` 兜底；
+- 衰减后**重排**：陈旧琐事自动让位于新鲜上下文，`decay_enabled=False` 可整体关闭（向下兼容）。
+
+```text
+# 实测（tests/test_stage8_graph_c.py）
+[OK] 衰减数学: exp(-1)=0.367879 / pinned 免衰 / linear=0.5 / none=1.0 / 开关关闭=1.0
+[OK] 衰减重排: old=5e-06 < new=1.0，置顶免衰
+[OK] 1-hop 关联召回: atoms=['atom_coffee', 'atom_suzhou'] explanations=2 例
+[OK] 软废弃联动：边 invalidated/weight=0 保留可追溯，置顶记忆免死
+```
+
+#### 零破坏升级
+
+- 扩展列（`mention_count` / `last_seen_at` / `weight` / `atom_id` / `status` / `invalidated_at`）
+  通过 `ALTER TABLE` **幂等补齐**，旧库升级零数据丢失，且补列先于索引创建，顺序严格安全；
+- `graph.enable=false` 或 `graph_recall_enabled=false` 时，读/写两侧均**零图谱副作用**，行为与改造前完全一致。
 
 ### 🎯 其他待办
 
 - [ ] 专属 WebUI 面板（配置项已预留）
 - [ ] 检索权重细粒度可调（当前为内置 `0.55` 向量 + `0.45` 关键词）
-- [ ] 记忆遗忘曲线 / 时间衰减（让久不用的记忆自动降权）
 - [ ] 记忆导出 / 导入（JSON / Markdown）
 - [ ] 更多宿主适配器（不限于 AstrBot）
+- [ ] 2-hop 以上多跳推理与「时间旅行」查询（当前 1-hop 已落地）
+- [x] ~~记忆遗忘曲线 / 时间衰减~~ → 已落地（方案 C：艾宾浩斯衰减 + `pinned` 免衰）
+- [x] ~~知识图谱运行期写入~~ → 已落地（方案 C：三元组抽取 + 1-hop 召回）
 
 ---
 
@@ -783,7 +822,8 @@ SQLite 在万级记忆规模、带索引的情况下，检索是毫秒级的。�
 
 | 能力 | 当前状态 |
 | :-- | :-- |
-| 知识图谱运行期写入（`kg_nodes` / `kg_edges`） | 表结构与迁移映射已就绪，自动构建待方案 C 接入 |
+| 知识图谱运行期读写（`kg_nodes` / `kg_edges`） | ✅ 已落地（方案 C）：三元组自动抽取落库 + 1-hop 关联子图召回 + 软废弃联动失效 |
+| 记忆时间衰减（`ttl_days` / `decay_type` / `pinned`） | ✅ 已落地（方案 C）：艾宾浩斯 `exp(-λ·Δt/ttl)` 曲线，`pinned=1` 永不衰减 |
 | 专属 WebUI 面板（`webui.*`） | 配置项已预留，HTTP 面板待实现 |
 | 检索权重细粒度调节（`retrieval.weight_*`） | 配置项已预留，当前为内置 `0.55` 向量 + `0.45` 关键词 |
 | 原生 FTS5 关键词引擎 | ✅ 已落地（方案 B）：倒排索引 + 中文预分词 + 四类同步触发器，无 FTS5 时自动回退 |

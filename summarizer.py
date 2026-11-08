@@ -73,6 +73,55 @@ L3_PIN_KEYWORDS: Tuple[str, ...] = (
 )
 
 
+# ---------------------------------------------------------------------------
+# 方案 C：轻量规则三元组抽取（LLM 不可用时的 100% 本地兜底）
+# ---------------------------------------------------------------------------
+# 每条规则为 (正则, 关系类型, 默认主语, 主语类型, 宾语类型)：
+# - 正则第 1 个捕获组为 tail（实体宾语）；
+# - 主语固定归一化为「主人」，与用户画像语义对齐；
+# - 规则按顺序匹配，同一句可命中多条（如「我住在苏州，喜欢美式咖啡」会被拆成两句后各命中）。
+_TRIPLE_RULES: Tuple[Tuple[str, str, str, str, str], ...] = (
+    # 偏好 / 口味（吃掉「喝/吃/看」等动词，确保 tail 是纯实体）
+    (r"(?:我|主人|用户|本人)?\s*(?:很|超|特别|最|非常|一直)?\s*(?:喜欢|喜爱|偏好|爱喝|爱吃|爱看|爱好)\s*(?:喝|吃|看|玩|听|读|用|穿)?\s*(.+)", "偏好", "主人", "person", "object"),
+    # 厌恶 / 忌口
+    (r"(?:我|主人|用户|本人)?\s*(?:不喜欢|讨厌|厌恶|不吃|不喝|反感|忌口)\s*(?:吃|喝|看|听|用|穿)?\s*(.+)", "厌恶", "主人", "person", "object"),
+    # 居住地
+    (r"(?:我|主人|用户|本人)?\s*(?:住在|居住在|居住于|定居在|定居于|落户在|老家在)\s*(.+)", "居住于", "主人", "person", "place"),
+    # 姓名
+    (r"(?:我的名字是|我的名字叫|我叫|本名是|昵称是)\s*(.+)", "名为", "主人", "person", "person"),
+    # 职业 / 身份
+    (r"(?:我的职业是|我是一名|我是一个|我的工作是|我的职位是)\s*(.+)", "职业为", "主人", "person", "role"),
+    # 生日 / 出生
+    (r"(?:我的生日是|我生日是|我出生于|我出生在)\s*(.+)", "生日为", "主人", "person", "date"),
+    # 工号 / 编号类强标识
+    (r"(?:我的工号是|工号是|我的编号是|我的身份证号是|我的手机号是)\s*(.+)", "工号为", "主人", "person", "id"),
+    # 宠物 / 持有物
+    (r"(?:我养了|我有一只|我有一台|我有一辆|我有一块|我有)\s*(.+)", "拥有", "主人", "person", "object"),
+    # 常用工具 / 器材
+    (r"(?:我使用|我常用|我用的是|我习惯用|我一直用)\s*(.+)", "使用", "主人", "person", "object"),
+    # 工作单位
+    (r"(?:我在|我就职于|我工作在|任职于)\s*(.+?)\s*(?:工作|上班|任职|就职)", "工作于", "主人", "person", "org"),
+)
+
+# tail 中若出现这些疑问/指代片段，说明不是稳定事实，直接丢弃
+_TRIPLE_TAIL_BLOCKLIST: Tuple[str, ...] = (
+    "什么",
+    "谁",
+    "哪里",
+    "怎么",
+    "为什么",
+    "吗",
+    "呢",
+    "？",
+    "?",
+    "你",
+    "他",
+    "她",
+    "它",
+    "们",
+)
+
+
 def _normalize_fact_key(text: Any) -> str:
     """归一化事实文本作为映射键（去空白与中英文标点，统一小写）。"""
     return re.sub(r"[\s，。！？、；：,.!?;:~～\-—_\"'“”‘’()（）\[\]【】]+", "", str(text or "")).lower()
@@ -202,6 +251,34 @@ class MemorySummarizer:
         self._stat_dlq_completed: int = 0  # 重试成功转 completed
         self._stat_dlq_failed: int = 0     # 超过 max_retries 转 failed
         self._stat_dlq_rescheduled: int = 0  # 失败后重新排队
+
+        # ---- 方案 C：L3 时序知识图谱抽取开关与阈值 ----
+        graph_cfg: Dict[str, Any] = {}
+        raw_graph_cfg = self.config.get("graph")
+        if isinstance(raw_graph_cfg, dict):
+            graph_cfg = raw_graph_cfg
+
+        def _graph_setting(key: str, default: Any) -> Any:
+            """图谱写侧配置读取：优先 graph 子节点，其次顶层同名键。"""
+            if key in graph_cfg:
+                return graph_cfg.get(key)
+            return self.config.get(key, default)
+
+        self.graph_enabled: bool = bool(_graph_setting("enable", True))
+        try:
+            self.graph_max_triples: int = max(
+                1, int(_graph_setting("max_triples_per_fact", 6))
+            )
+        except (TypeError, ValueError):
+            self.graph_max_triples = 6
+        try:
+            self.graph_confidence: float = float(
+                _graph_setting("edge_confidence", 0.9)
+            )
+        except (TypeError, ValueError):
+            self.graph_confidence = 0.9
+        # 可观测性：累计写入三元组数（仅统计，不参与业务）
+        self._stat_kg_triples: int = 0
 
     # ------------------------------------------------------------------
     # 配置解析辅助（容错：任何非法值都退回默认，绝不因配置抛异常）
@@ -1239,14 +1316,16 @@ class MemorySummarizer:
                 continue
             if not fact_text:
                 continue
-            facts.append(
-                {
-                    "fact": fact_text,
-                    "importance": score,
-                    "pinned": pinned,
-                    "atom_type": atom_type,
-                }
-            )
+            entry: Dict[str, Any] = {
+                "fact": fact_text,
+                "importance": score,
+                "pinned": pinned,
+                "atom_type": atom_type,
+            }
+            # 方案 C：模型若直接给出结构化三元组，原样透传给图谱写入层
+            if isinstance(item, dict) and item.get("triples"):
+                entry["triples"] = item.get("triples")
+            facts.append(entry)
         try:
             limit = max(1, int(max_facts))
         except (TypeError, ValueError):
@@ -1297,7 +1376,10 @@ class MemorySummarizer:
             prompt = (
                 "请从以下多轮对话中提取值得长期记住的客观事实、用户偏好、习惯或约束。"
                 "返回 JSON 数组，每项格式为: "
-                '{"fact": "简洁事实陈述", "importance": 0.0到1.0之间的小数}。\n'
+                '{"fact": "简洁事实陈述", "importance": 0.0到1.0之间的小数, '
+                '"triples": [{"head": "主体", "relation": "关系", "tail": "客体"}]}。'
+                "triples 为可选字段，用于构建知识图谱（例如 "
+                '{"head":"主人","relation":"偏好","tail":"美式咖啡"}）。\n'
                 f"{context}"
             )
             headers = {
@@ -1351,6 +1433,198 @@ class MemorySummarizer:
         return self._rule_extract_facts(
             merged_user, merged_assistant, max_facts=max_facts
         )
+
+    # ------------------------------------------------------------------
+    # 方案 C：L3 时序知识图谱写入（实体三元组抽取 + 落库 + 软废弃联动）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_triple_tail(raw: str, max_len: int = 24) -> str:
+        """
+        清洗三元组宾语：去标点/空白/量词尾缀，过滤疑问句与指代片段。
+
+        返回空串表示该候选不是稳定事实（调用方应丢弃）。
+        """
+        tail = str(raw or "").strip()
+        if not tail:
+            return ""
+        # 截断到首个句读/连接词，避免把整句都当成实体
+        tail = re.split(r"[。！？!?；;，,、\n]|(?:并且|而且|还有|然后|所以|但是|因为)", tail)[0]
+        tail = tail.strip(" \t\r\n\"'“”‘’()（）[]【】《》<>")
+        # 去掉常见量词/语气尾缀
+        tail = re.sub(r"(?:的|了|啊|呀|吧|哦|啦|呢|嘛|哈)+$", "", tail)
+        if not tail:
+            return ""
+        # 疑问 / 指代 / 过长 → 不是稳定实体
+        if any(bad in tail for bad in _TRIPLE_TAIL_BLOCKLIST):
+            return ""
+        if len(tail) > max_len:
+            return ""
+        return tail
+
+    def _rule_extract_triples(self, text: str) -> List[Dict[str, str]]:
+        """
+        规则层三元组抽取：从一条事实文本中提取 ``(head, relation, tail)``。
+
+        设计目标：零依赖、可解释、可控误报。宁可少抽，也不写脏数据到图谱。
+        同一句可能命中多条规则（如「我是程序员，喜欢美式咖啡」），逐条独立抽取。
+        """
+        content = str(text or "").strip()
+        if not content:
+            return []
+
+        triples: List[Dict[str, str]] = []
+        seen: set[Tuple[str, str, str]] = set()
+        # 按句读切分，逐句匹配，降低跨句误抽
+        segments = [seg for seg in re.split(r"[。！？!?\n；;]+", content) if seg.strip()]
+        if not segments:
+            segments = [content]
+
+        for seg in segments:
+            for pattern, relation, head, head_type, tail_type in _TRIPLE_RULES:
+                match = re.search(pattern, seg)
+                if not match:
+                    continue
+                tail = self._normalize_triple_tail(match.group(1))
+                if not tail or tail == head:
+                    continue
+                key = (head, relation, tail)
+                if key in seen:
+                    continue
+                seen.add(key)
+                triples.append(
+                    {
+                        "head": head,
+                        "relation": relation,
+                        "tail": tail,
+                        "head_type": head_type,
+                        "tail_type": tail_type,
+                    }
+                )
+                if len(triples) >= self.graph_max_triples:
+                    return triples
+        return triples
+
+    def _coerce_llm_triples(
+        self, raw_triples: Any
+    ) -> List[Dict[str, str]]:
+        """
+        归一化 LLM 返回的三元组（支持 dict / list / "head|relation|tail" 字符串）。
+
+        任何非法结构一律静默丢弃，绝不因模型幻觉格式污染图谱。
+        """
+        if not raw_triples:
+            return []
+        items: List[Any]
+        if isinstance(raw_triples, dict):
+            items = [raw_triples]
+        elif isinstance(raw_triples, (list, tuple)):
+            items = list(raw_triples)
+        else:
+            return []
+
+        out: List[Dict[str, str]] = []
+        for item in items:
+            head = relation = tail = ""
+            head_type = tail_type = "concept"
+            if isinstance(item, dict):
+                head = str(item.get("head") or item.get("subject") or "").strip()
+                relation = str(item.get("relation") or item.get("predicate") or "").strip()
+                tail = str(item.get("tail") or item.get("object") or "").strip()
+                head_type = str(item.get("head_type") or "concept")[:24]
+                tail_type = str(item.get("tail_type") or "concept")[:24]
+            elif isinstance(item, str):
+                parts = [p.strip() for p in re.split(r"[|｜,，:：\t]", item) if p.strip()]
+                if len(parts) >= 3:
+                    head, relation, tail = parts[0], parts[1], parts[2]
+            if not head or not relation or not tail:
+                continue
+            tail_clean = self._normalize_triple_tail(tail)
+            if not tail_clean or tail_clean == head:
+                continue
+            out.append(
+                {
+                    "head": head[:32],
+                    "relation": relation[:32],
+                    "tail": tail_clean,
+                    "head_type": head_type or "concept",
+                    "tail_type": tail_type or "concept",
+                }
+            )
+            if len(out) >= self.graph_max_triples:
+                break
+        return out
+
+    def _upsert_kg_triples_for_atom(
+        self,
+        session_id: str,
+        atom_id: str,
+        fact_text: str,
+        now: float,
+        llm_triples: Any = None,
+    ) -> int:
+        """
+        将一条记忆原子关联的三元组写入 kg_nodes / kg_edges。
+
+        抽取来源优先级：LLM 结构化三元组 → 规则兜底，合并去重后落库。
+        异常安全：图谱写入失败只记日志，绝不影响 L2 原子入库主链路。
+
+        :return: 实际写入/强化成功的三元组条数。
+        """
+        if not self.graph_enabled:
+            return 0
+        if not hasattr(self.storage, "upsert_kg_triple"):
+            return 0
+
+        candidates: List[Dict[str, str]] = []
+        candidates.extend(self._coerce_llm_triples(llm_triples))
+        candidates.extend(self._rule_extract_triples(fact_text))
+
+        if not candidates:
+            return 0
+
+        written = 0
+        seen: set[Tuple[str, str, str]] = set()
+        for triple in candidates:
+            head = str(triple.get("head") or "").strip()
+            relation = str(triple.get("relation") or "").strip()
+            tail = str(triple.get("tail") or "").strip()
+            if not head or not relation or not tail:
+                continue
+            key = (head, relation, tail)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                result = self.storage.upsert_kg_triple(
+                    scope_key=session_id,
+                    head=head,
+                    relation=relation,
+                    tail=tail,
+                    atom_id=atom_id,
+                    fact_text=fact_text,
+                    now=now,
+                    head_type=str(triple.get("head_type") or "concept"),
+                    tail_type=str(triple.get("tail_type") or "concept"),
+                    confidence=self.graph_confidence,
+                )
+                if result:
+                    written += 1
+            except Exception as exc:  # pragma: no cover - 存储层已容错，这里双保险
+                logger.debug(
+                    "[MemorySummarizer] 图谱三元组写入异常（忽略） atom=%s triple=%s: %s",
+                    atom_id,
+                    key,
+                    exc,
+                )
+            if len(seen) >= self.graph_max_triples:
+                break
+
+        self._stat_kg_triples += written
+        if written:
+            logger.debug(
+                "[MemorySummarizer] 图谱写入 atom=%s triples=%d", atom_id, written
+            )
+        return written
 
     def _upsert_l2_atom(
         self,
@@ -1641,6 +1915,7 @@ class MemorySummarizer:
             return 0
 
         applied = 0
+        deprecated_ids: List[str] = []
         # 本轮新建/融合出的原子集合：冲突废弃必须跳过它们，避免“自我废弃”
         protected_ids = {str(v) for v in fact_atom_map.values() if v}
         try:
@@ -1689,6 +1964,7 @@ class MemorySummarizer:
                     )
                     if cur.rowcount:
                         applied += 1
+                        deprecated_ids.append(atom_id)
                         logger.info(
                             "[MemorySummarizer] 冲突废弃旧事实 atom=%s reason=%s replacement=%s",
                             atom_id,
@@ -1701,6 +1977,24 @@ class MemorySummarizer:
                 exc,
                 exc_info=True,
             )
+
+        # 方案 C：软废弃联动失效图谱关系边（边标记 invalidated，权重归零，不物理删除）
+        if deprecated_ids:
+            try:
+                if hasattr(self.storage, "invalidate_kg_edges_for_atoms"):
+                    invalidated = self.storage.invalidate_kg_edges_for_atoms(
+                        deprecated_ids, now
+                    )
+                    if invalidated:
+                        logger.info(
+                            "[MemorySummarizer] 图谱边联动失效 atoms=%d edges=%d",
+                            len(deprecated_ids),
+                            invalidated,
+                        )
+            except Exception as kg_exc:  # pragma: no cover - 双保险
+                logger.warning(
+                    "[MemorySummarizer] 图谱边联动失效异常（已忽略）: %s", kg_exc
+                )
         return applied
 
     @staticmethod
@@ -1904,6 +2198,21 @@ class MemorySummarizer:
                     now=now,
                 )
                 fact_atom_map[_normalize_fact_key(fact_text)] = atom_id
+                # 方案 C：图谱三元组写入（失败不阻断 L2 入库主链路）
+                try:
+                    self._upsert_kg_triples_for_atom(
+                        session_id=clean_session,
+                        atom_id=atom_id,
+                        fact_text=fact_text,
+                        now=now,
+                        llm_triples=item.get("triples"),
+                    )
+                except Exception as kg_exc:  # pragma: no cover - 双保险
+                    logger.warning(
+                        "[MemorySummarizer] 图谱写入异常（已忽略） atom=%s: %s",
+                        atom_id,
+                        kg_exc,
+                    )
                 logger.debug(
                     "[MemorySummarizer] Processed fact session=%s atom=%s merged=%s pinned=%s value_score=%s",
                     clean_session,

@@ -192,6 +192,30 @@
       }
     }
   },
+  "graph": {
+    "description": "L3 知识图谱抽取（方案 C）",
+    "type": "object",
+    "items": {
+      "enable": {
+        "description": "启用知识图谱三元组抽取",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后总结阶段会自动抽取 (head, relation, tail) 三元组并写入 kg_nodes/kg_edges；关闭则零图谱副作用"
+      },
+      "max_triples_per_fact": {
+        "description": "单条事实最大三元组条数",
+        "type": "int",
+        "default": 6,
+        "hint": "防止长文本过度抽取导致图谱膨胀，建议 4~8"
+      },
+      "edge_confidence": {
+        "description": "规则抽取关系的置信度",
+        "type": "float",
+        "default": 0.9,
+        "hint": "规则抽取的可解释性高，默认 0.9；模型给出的结构化三元组同样以此为下限"
+      }
+    }
+  },
   "models": {
     "description": "向量化与重排模型配置",
     "type": "object",
@@ -337,6 +361,48 @@
         "type": "float",
         "default": 5.0,
         "hint": "方案B内存向量矩阵缓存：定期比对数据库指纹以感知外部写入；0 表示每次检索都校验（牺牲少量性能换绝对一致）"
+      },
+      "graph_recall_enabled": {
+        "description": "启用图谱 1-hop 关联召回",
+        "type": "bool",
+        "default": true,
+        "hint": "query 命中图谱实体时，沿 kg_edges 召回 1-hop 关联记忆并注入候选池（多跳解释能力）"
+      },
+      "graph_entity_limit": {
+        "description": "图谱种子实体上限",
+        "type": "int",
+        "default": 5,
+        "hint": "单次检索最多匹配多少个实体节点作为 1-hop 展开种子"
+      },
+      "graph_edge_limit": {
+        "description": "图谱关联边上限",
+        "type": "int",
+        "default": 20,
+        "hint": "1-hop 展开时最多取多少条活跃关联边，避免大图拖慢检索"
+      },
+      "graph_score_bonus": {
+        "description": "图谱关联加分权重",
+        "type": "float",
+        "default": 0.15,
+        "hint": "图谱命中项在粗排融合分上的加成系数，0 表示仅入池不加分"
+      },
+      "decay_enabled": {
+        "description": "启用艾宾浩斯时间衰减",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后精排得分乘以时间衰减系数，让陈旧琐事自然让位于新鲜上下文"
+      },
+      "decay_lambda": {
+        "description": "衰减速率 λ",
+        "type": "float",
+        "default": 1.0,
+        "hint": "Score=Score×exp(-λ·Δt/ttl_days)；λ=1 表示过满 ttl 后衰减到约 36.8%"
+      },
+      "decay_floor": {
+        "description": "衰减系数下限",
+        "type": "float",
+        "default": 0.05,
+        "hint": "防止极旧记忆被压到 0 后彻底无法召回；0 表示不设下限"
       }
     }
   },

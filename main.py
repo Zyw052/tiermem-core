@@ -685,6 +685,8 @@ class AgentMemoryPlugin(Star):
             "summary_turn_interval": self.turn_interval,
             # 自作判定门禁配置（summarizer 内部构造 EvaluatorGate 时读取）
             "evaluator": evaluator_runtime,
+            # 方案 C：L3 知识图谱抽取配置（三元组抽取/落库阈值）
+            "graph": self._section("graph"),
             "summarizer_queue_maxsize": _safe_int(
                 self.config.get("summarizer_queue_maxsize"), 1000, minimum=1
             ),
@@ -751,6 +753,23 @@ class AgentMemoryPlugin(Star):
             "access_flush_threshold": _safe_int(
                 retrieval_cfg.get("access_flush_threshold"), 200, minimum=1
             ),
+            # 方案 C-1：图谱 1-hop 关联召回
+            "graph_recall_enabled": bool(
+                retrieval_cfg.get("graph_recall_enabled", True)
+            ),
+            "graph_entity_limit": _safe_int(
+                retrieval_cfg.get("graph_entity_limit"), 5, minimum=1
+            ),
+            "graph_edge_limit": _safe_int(
+                retrieval_cfg.get("graph_edge_limit"), 20, minimum=1
+            ),
+            "graph_score_bonus": _safe_float(
+                retrieval_cfg.get("graph_score_bonus"), 0.15
+            ),
+            # 方案 C-2：艾宾浩斯时间衰减
+            "decay_enabled": bool(retrieval_cfg.get("decay_enabled", True)),
+            "decay_lambda": _safe_float(retrieval_cfg.get("decay_lambda"), 1.0),
+            "decay_floor": _safe_float(retrieval_cfg.get("decay_floor"), 0.05),
         }
         # 用户配置覆盖默认值
         retriever_cfg.update(retrieval_cfg)
@@ -1354,6 +1373,18 @@ class AgentMemoryPlugin(Star):
             f"L3 置顶 `{tiers['l2_pinned']}` 条 · "
             f"图谱 `{tiers['kg_nodes']}` 节点 / `{tiers['kg_edges']}` 关系"
         )
+
+        # ---- 1.1 方案 C：图谱活跃度（1-hop 关联召回健康度）----
+        if self.storage is not None and hasattr(self.storage, "get_kg_stats"):
+            try:
+                kg = self.storage.get_kg_stats()
+                lines.append(
+                    f"- **图谱**: 活跃关系 `{kg.get('active_edges', 0)}` · "
+                    f"已失效 `{kg.get('invalidated_edges', 0)}` · "
+                    f"孤立实体 `{kg.get('orphan_nodes', 0)}`"
+                )
+            except Exception as exc:
+                logger.debug("[agent_memory] 获取图谱统计失败: %s", exc)
 
         # ---- 2. 注入策略 ----
         try:

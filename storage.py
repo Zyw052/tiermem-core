@@ -16,6 +16,7 @@ import struct
 import threading
 import time
 import logging
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -31,6 +32,56 @@ except Exception:  # pragma: no cover
     _np = None
 
 NUMPY_AVAILABLE: bool = _np is not None
+
+# ---------------------------------------------------------------------------
+# 方案 C：L3 时序知识图谱扩展列（幂等补列，不破坏既有 kg_nodes/kg_edges 结构）
+# ---------------------------------------------------------------------------
+# 设计说明：
+# 1. 基础 DDL 已建好 kg_nodes / kg_edges 两张表，但缺少运行期所需的
+#    「提及次数 / 最新出现时间 / 边权重 / 关联原子 / 失效标记」字段；
+# 2. 这里以 ALTER TABLE ADD COLUMN 方式幂等补齐，旧库升级零数据丢失，
+#    新库直接由 DDL_STATEMENTS 建全；
+# 3. 关联原子 atom_id 是「记忆原子 ↔ 图谱关系」的双向回溯锚点：
+#    原子被软废弃时，可沿 atom_id 精准失效对应关系边（见 invalidate_kg_edges_for_atoms）。
+KG_NODE_EXTENDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("mention_count", "INTEGER NOT NULL DEFAULT 1"),
+    ("first_seen_at", "REAL NOT NULL DEFAULT 0.0"),
+    ("last_seen_at", "REAL NOT NULL DEFAULT 0.0"),
+)
+
+KG_EDGE_EXTENDED_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    ("weight", "REAL NOT NULL DEFAULT 1.0"),
+    ("atom_id", "TEXT NOT NULL DEFAULT ''"),
+    ("status", "TEXT NOT NULL DEFAULT 'active'"),
+    ("invalidated_at", "REAL NOT NULL DEFAULT 0.0"),
+    ("reinforcement_count", "INTEGER NOT NULL DEFAULT 1"),
+)
+
+
+def ensure_kg_columns(conn: sqlite3.Connection) -> bool:
+    """
+    幂等补齐 kg_nodes / kg_edges 的方案 C 扩展列。
+
+    :return: True 表示两表扩展列均已就绪；False 表示探测失败（调用方应降级处理）。
+    """
+    try:
+        for table, cols in (
+            ("kg_nodes", KG_NODE_EXTENDED_COLUMNS),
+            ("kg_edges", KG_EDGE_EXTENDED_COLUMNS),
+        ):
+            existing = {
+                str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if not existing:
+                # 表不存在（极端情况），交由调用方初始化后再补
+                continue
+            for col_name, col_def in cols:
+                if col_name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def};")
+        return True
+    except Exception as exc:  # pragma: no cover - 结构异常极罕见
+        logger.warning("[MemoryStorage] 图谱扩展列补齐失败（降级）: %s", exc)
+        return False
 
 # CJK / 英文分词正则（与 FTS5 unicode61 分词器的行为对齐）
 _CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
@@ -149,6 +200,9 @@ DDL_STATEMENTS = [
         summary TEXT NOT NULL DEFAULT '',
         attributes_json TEXT NOT NULL DEFAULT '{}',
         weight REAL NOT NULL DEFAULT 1.0,
+        mention_count INTEGER NOT NULL DEFAULT 1,
+        first_seen_at REAL NOT NULL DEFAULT 0.0,
+        last_seen_at REAL NOT NULL DEFAULT 0.0,
         created_at REAL NOT NULL,
         updated_at REAL NOT NULL,
         UNIQUE(scope_key, entity_name, entity_type)
@@ -166,6 +220,11 @@ DDL_STATEMENTS = [
         relation_type TEXT NOT NULL,
         fact_text TEXT NOT NULL DEFAULT '',
         confidence REAL NOT NULL DEFAULT 1.0,
+        weight REAL NOT NULL DEFAULT 1.0,
+        atom_id TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'active',
+        invalidated_at REAL NOT NULL DEFAULT 0.0,
+        reinforcement_count INTEGER NOT NULL DEFAULT 1,
         valid_from REAL,
         valid_until REAL,
         created_at REAL NOT NULL,
@@ -176,6 +235,7 @@ DDL_STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_kg_edges_source ON kg_edges(scope_key, source_node_id);",
     "CREATE INDEX IF NOT EXISTS idx_kg_edges_target ON kg_edges(scope_key, target_node_id);",
+    "CREATE INDEX IF NOT EXISTS idx_kg_edges_atom ON kg_edges(scope_key, atom_id);",
 
     # 5. 异步任务死信与重试队列表
     """
@@ -800,6 +860,8 @@ class MemoryStorage:
         try:
             conn = self.connect()
             with conn:
+                # 方案 C：旧库先补齐图谱扩展列，保证后续索引语句可正常创建
+                ensure_kg_columns(conn)
                 for stmt in DDL_STATEMENTS:
                     conn.execute(stmt)
                 # 方案 B-1：FTS5 索引列必须在触发器创建前就绪
@@ -807,6 +869,8 @@ class MemoryStorage:
                 if self._probe_fts5(conn):
                     for stmt in FTS_DDL_STATEMENTS:
                         conn.execute(stmt)
+                # 方案 C：幂等补齐知识图谱扩展列（旧库平滑升级）
+                ensure_kg_columns(conn)
             logger.info("MemoryStorage schema initialized at %s", self.db_path)
 
             # FTS5 后置维护（独立事务：失败不能影响主表初始化）
@@ -1236,6 +1300,364 @@ class MemoryStorage:
             logger.debug("统计 L3 置顶数失败（忽略）: %s", exc)
             stats["l2_pinned"] = 0
 
+        return stats
+
+    # ------------------------------------------------------------------
+    # 方案 C：L3 时序知识图谱读写闭环
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_kg_token(text: Any, limit: int = 64) -> str:
+        """图谱实体/关系名归一化：去空白、去包裹标点、截断超长。"""
+        raw = str(text or "").strip()
+        raw = raw.strip(" \t\r\n,，。.;；:：!！?？\"'“”‘’()（）[]【】《》<>")
+        return raw[:limit]
+
+    def upsert_kg_triple(
+        self,
+        scope_key: str,
+        head: str,
+        relation: str,
+        tail: str,
+        atom_id: str = "",
+        fact_text: str = "",
+        now: Optional[float] = None,
+        head_type: str = "concept",
+        tail_type: str = "concept",
+        confidence: float = 1.0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        写入一条 ``(head, relation, tail)`` 三元组到 kg_nodes / kg_edges。
+
+        行为契约（全部幂等）：
+        - 实体节点按 ``(scope_key, entity_name, entity_type)`` 去重，
+          重复出现时 ``mention_count += 1``、``last_seen_at`` 刷新、``weight`` 轻微增强；
+        - 关系边按 ``(scope_key, source, target, relation_type, atom_id)`` 去重，
+          重复出现时 ``weight += 1``、``reinforcement_count += 1``；
+        - 若该边此前被标记 invalidated，重新观察到即复活为 active（事实再次被提及）。
+
+        :return: 成功时返回节点/边 ID 与是否新建的信息；失败或无有效实体返回 None。
+        """
+        head_name = self._normalize_kg_token(head)
+        tail_name = self._normalize_kg_token(tail)
+        relation_type = self._normalize_kg_token(relation, limit=32) or "related_to"
+        if not head_name or not tail_name or head_name == tail_name:
+            return None
+
+        stamp = float(now if now is not None else time.time())
+        scope = str(scope_key or "global")
+        atom_key = str(atom_id or "")
+
+        try:
+            conn = self.connect()
+            ensure_kg_columns(conn)
+
+            def _touch_node(name: str, etype: str) -> Tuple[str, bool]:
+                """获取或创建实体节点，返回 (node_id, is_new)。"""
+                etype_clean = str(etype or "concept")[:24]
+                row = conn.execute(
+                    """
+                    SELECT node_id FROM kg_nodes
+                    WHERE scope_key = ? AND entity_name = ? AND entity_type = ?
+                    """,
+                    (scope, name, etype_clean),
+                ).fetchone()
+                if row is not None:
+                    node_id = str(row["node_id"])
+                    conn.execute(
+                        """
+                        UPDATE kg_nodes
+                        SET mention_count = COALESCE(mention_count, 1) + 1,
+                            last_seen_at = ?,
+                            weight = MIN(10.0, COALESCE(weight, 1.0) + 0.1),
+                            updated_at = ?
+                        WHERE node_id = ?
+                        """,
+                        (stamp, stamp, node_id),
+                    )
+                    return node_id, False
+                node_id = f"kgn_{uuid.uuid4().hex[:16]}"
+                conn.execute(
+                    """
+                    INSERT INTO kg_nodes (
+                        node_id, scope_key, entity_name, entity_type, summary,
+                        attributes_json, weight, mention_count, first_seen_at,
+                        last_seen_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, '', '{}', 1.0, 1, ?, ?, ?, ?)
+                    """,
+                    (node_id, scope, name, etype_clean, stamp, stamp, stamp, stamp),
+                )
+                return node_id, True
+
+            with conn:
+                head_id, head_new = _touch_node(head_name, head_type)
+                tail_id, tail_new = _touch_node(tail_name, tail_type)
+
+                edge_row = conn.execute(
+                    """
+                    SELECT edge_id, status FROM kg_edges
+                    WHERE scope_key = ? AND source_node_id = ? AND target_node_id = ?
+                      AND relation_type = ? AND atom_id = ?
+                    """,
+                    (scope, head_id, tail_id, relation_type, atom_key),
+                ).fetchone()
+
+                if edge_row is not None:
+                    edge_id = str(edge_row["edge_id"])
+                    conn.execute(
+                        """
+                        UPDATE kg_edges
+                        SET weight = COALESCE(weight, 1.0) + 1.0,
+                            reinforcement_count = COALESCE(reinforcement_count, 1) + 1,
+                            fact_text = CASE WHEN ? != '' THEN ? ELSE fact_text END,
+                            confidence = MAX(COALESCE(confidence, 0.0), ?),
+                            status = 'active',
+                            invalidated_at = 0.0,
+                            updated_at = ?
+                        WHERE edge_id = ?
+                        """,
+                        (str(fact_text or ""), str(fact_text or ""), float(confidence), stamp, edge_id),
+                    )
+                    edge_new = False
+                else:
+                    edge_id = f"kge_{uuid.uuid4().hex[:16]}"
+                    conn.execute(
+                        """
+                        INSERT INTO kg_edges (
+                            edge_id, scope_key, source_node_id, target_node_id,
+                            relation_type, fact_text, confidence, weight, atom_id,
+                            status, invalidated_at, reinforcement_count,
+                            valid_from, valid_until, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1.0, ?, 'active', 0.0, 1, ?, NULL, ?, ?)
+                        """,
+                        (
+                            edge_id,
+                            scope,
+                            head_id,
+                            tail_id,
+                            relation_type,
+                            str(fact_text or ""),
+                            float(confidence),
+                            atom_key,
+                            stamp,
+                            stamp,
+                            stamp,
+                        ),
+                    )
+                    edge_new = True
+
+            return {
+                "head": head_name,
+                "relation": relation_type,
+                "tail": tail_name,
+                "head_node_id": head_id,
+                "tail_node_id": tail_id,
+                "edge_id": edge_id,
+                "node_created": bool(head_new or tail_new),
+                "edge_created": edge_new,
+            }
+        except Exception as exc:
+            logger.warning("[MemoryStorage] 图谱三元组写入失败（已忽略）: %s", exc)
+            return None
+
+    def expand_kg_subgraph(
+        self,
+        scope_key: str,
+        query_terms: Sequence[str],
+        max_entities: int = 5,
+        max_edges: int = 20,
+        include_global: bool = True,
+        all_scopes: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        以 query 命中的实体为种子，做 **1-hop 关联子图检索**。
+
+        :param query_terms: 已切分的 query 关键词（实体名匹配用）
+        :param all_scopes: True 表示不限作用域（仅在关闭严格会话隔离时使用）
+        :return: 关联边列表，每项含 ``entity / neighbor / relation / direction /
+                 atom_id / weight / fact_text``，按边权降序排列。
+        """
+        terms = [self._normalize_kg_token(t) for t in (query_terms or [])]
+        terms = [t for t in terms if t]
+        if not terms:
+            return []
+
+        scopes: List[str] = [str(scope_key or "global")]
+        if include_global and "global" not in scopes:
+            scopes.append("global")
+
+        try:
+            conn = self.connect()
+            ensure_kg_columns(conn)
+
+            placeholders = ",".join("?" for _ in scopes)
+            scope_clause = "" if all_scopes else f"scope_key IN ({placeholders}) AND "
+            scope_args: Tuple[Any, ...] = () if all_scopes else tuple(scopes)
+            # 1. 实体种子：精确命中优先，其次包含命中（query 词包含实体名或反之）
+            seed_nodes: List[Dict[str, Any]] = []
+            seen_seed: set[str] = set()
+            for term in terms:
+                like_term = f"%{term}%"
+                rows = conn.execute(
+                    f"""
+                    SELECT node_id, entity_name, entity_type, mention_count, weight
+                    FROM kg_nodes
+                    WHERE {scope_clause}(
+                            entity_name = ?
+                            OR entity_name LIKE ?
+                            OR ? LIKE '%' || entity_name || '%'
+                          )
+                    ORDER BY
+                        CASE WHEN entity_name = ? THEN 0 ELSE 1 END ASC,
+                        mention_count DESC,
+                        weight DESC
+                    LIMIT ?
+                    """,
+                    (*scope_args, term, like_term, term, term, int(max_entities)),
+                ).fetchall()
+                for row in rows:
+                    node_id = str(row["node_id"])
+                    if node_id in seen_seed:
+                        continue
+                    seen_seed.add(node_id)
+                    seed_nodes.append(
+                        {
+                            "node_id": node_id,
+                            "entity_name": str(row["entity_name"]),
+                            "entity_type": str(row["entity_type"] or "concept"),
+                            "mention_count": int(row["mention_count"] or 1),
+                        }
+                    )
+                    if len(seed_nodes) >= int(max_entities):
+                        break
+                if len(seed_nodes) >= int(max_entities):
+                    break
+
+            if not seed_nodes:
+                return []
+
+            # 2. 1-hop 关联边（双向：种子为 source 或 target 均纳入）
+            seed_ids = [n["node_id"] for n in seed_nodes]
+            id_ph = ",".join("?" for _ in seed_ids)
+            edge_scope_clause = (
+                "" if all_scopes else f"e.scope_key IN ({placeholders}) AND "
+            )
+            edge_rows = conn.execute(
+                f"""
+                SELECT e.edge_id, e.source_node_id, e.target_node_id,
+                       e.relation_type, e.weight, e.atom_id, e.fact_text, e.confidence,
+                       sn.entity_name AS source_name, tn.entity_name AS target_name
+                FROM kg_edges e
+                JOIN kg_nodes sn ON sn.node_id = e.source_node_id
+                JOIN kg_nodes tn ON tn.node_id = e.target_node_id
+                WHERE {edge_scope_clause}COALESCE(e.status, 'active') = 'active'
+                  AND (e.source_node_id IN ({id_ph}) OR e.target_node_id IN ({id_ph}))
+                ORDER BY COALESCE(e.weight, 1.0) DESC, e.updated_at DESC
+                LIMIT ?
+                """,
+                (*scope_args, *seed_ids, *seed_ids, int(max_edges)),
+            ).fetchall()
+
+            seed_lookup = {n["node_id"]: n["entity_name"] for n in seed_nodes}
+            results: List[Dict[str, Any]] = []
+            for row in edge_rows:
+                src = str(row["source_node_id"])
+                tgt = str(row["target_node_id"])
+                if src in seed_lookup:
+                    entity, neighbor, direction = seed_lookup[src], str(row["target_name"]), "out"
+                else:
+                    entity, neighbor, direction = seed_lookup[tgt], str(row["source_name"]), "in"
+                results.append(
+                    {
+                        "entity": entity,
+                        "neighbor": neighbor,
+                        "relation": str(row["relation_type"]),
+                        "direction": direction,
+                        "atom_id": str(row["atom_id"] or ""),
+                        "weight": float(row["weight"] or 1.0),
+                        "confidence": float(row["confidence"] or 1.0),
+                        "fact_text": str(row["fact_text"] or ""),
+                        "edge_id": str(row["edge_id"]),
+                    }
+                )
+            return results
+        except Exception as exc:
+            logger.warning("[MemoryStorage] 图谱 1-hop 子图检索失败（降级为无图谱召回）: %s", exc)
+            return []
+
+    def invalidate_kg_edges_for_atoms(
+        self, atom_ids: Sequence[str], now: Optional[float] = None
+    ) -> int:
+        """
+        原子被软废弃时，联动失效其关联的关系边。
+
+        - 边不物理删除，标记 ``status='invalidated'`` 并记录 ``invalidated_at``；
+        - ``weight`` 归零，``valid_until`` 记录失效时刻，保留可追溯性；
+        - 返回受影响边数（异常安全，失败返回 0）。
+        """
+        ids = [str(a) for a in (atom_ids or []) if str(a or "").strip()]
+        if not ids:
+            return 0
+        stamp = float(now if now is not None else time.time())
+        try:
+            conn = self.connect()
+            ensure_kg_columns(conn)
+            ph = ",".join("?" for _ in ids)
+            with conn:
+                cur = conn.execute(
+                    f"""
+                    UPDATE kg_edges
+                    SET status = 'invalidated',
+                        invalidated_at = ?,
+                        valid_until = ?,
+                        weight = 0.0,
+                        updated_at = ?
+                    WHERE atom_id IN ({ph})
+                      AND COALESCE(status, 'active') = 'active'
+                    """,
+                    (stamp, stamp, stamp, *ids),
+                )
+                return int(cur.rowcount or 0)
+        except Exception as exc:
+            logger.warning("[MemoryStorage] 图谱边联动失效失败（已忽略）: %s", exc)
+            return 0
+
+    def get_kg_stats(self) -> Dict[str, int]:
+        """图谱健康统计：节点数 / 活跃边数 / 失效边数 / 孤立节点数（全容错）。"""
+        stats = {
+            "nodes": 0,
+            "edges": 0,
+            "active_edges": 0,
+            "invalidated_edges": 0,
+            "orphan_nodes": 0,
+        }
+        try:
+            conn = self.connect()
+            ensure_kg_columns(conn)
+            stats["nodes"] = int(
+                conn.execute("SELECT COUNT(1) AS c FROM kg_nodes").fetchone()["c"]
+            )
+            stats["edges"] = int(
+                conn.execute("SELECT COUNT(1) AS c FROM kg_edges").fetchone()["c"]
+            )
+            stats["active_edges"] = int(
+                conn.execute(
+                    "SELECT COUNT(1) AS c FROM kg_edges WHERE COALESCE(status,'active')='active'"
+                ).fetchone()["c"]
+            )
+            stats["invalidated_edges"] = stats["edges"] - stats["active_edges"]
+            stats["orphan_nodes"] = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(1) AS c FROM kg_nodes n
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM kg_edges e
+                        WHERE e.source_node_id = n.node_id OR e.target_node_id = n.node_id
+                    )
+                    """
+                ).fetchone()["c"]
+            )
+        except Exception as exc:
+            logger.debug("[MemoryStorage] 图谱统计失败（忽略）: %s", exc)
         return stats
 
     def toggle_atom_pin(self, atom_id: str) -> Dict[str, Any]:
