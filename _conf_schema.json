@@ -29,6 +29,12 @@
     "default": 1000,
     "hint": "队列满时降级写入 task_dlq 死信表，绝不阻塞主对话链路"
   },
+  "summary_idle_flush_seconds": {
+    "description": "会话静默超时刷盘阈值（秒）",
+    "type": "int",
+    "default": 180,
+    "hint": "会话在该时长内无新轮次时，自动把缓冲池中的尾部轮次打包析出，避免记忆滞留内存；0 表示关闭"
+  },
   "summarizer": {
     "description": "独立总结与提炼模型配置",
     "type": "object",
@@ -265,6 +271,24 @@
         "type": "float",
         "default": 2.0,
         "hint": "同一会话相同内容在该窗口内只记录一次，抵御宿主重复回调"
+      },
+      "strict_session_isolation": {
+        "description": "严格会话隔离（默认开启）",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后只召回本会话记忆；仅当记忆 scope_key='global' 时才允许跨群/私聊全局召回，物理杜绝串台"
+      },
+      "access_flush_interval": {
+        "description": "访问计数异步刷盘间隔（秒）",
+        "type": "float",
+        "default": 60.0,
+        "hint": "检索命中计数先在内存累加，按此间隔异步刷盘，保证检索链路纯读不抢 SQLite 写锁"
+      },
+      "access_flush_threshold": {
+        "description": "访问计数刷盘条数阈值",
+        "type": "int",
+        "default": 200,
+        "hint": "内存中累计的访问计数达到该条数时立即触发一次异步刷盘"
       }
     }
   },

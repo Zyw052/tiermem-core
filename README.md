@@ -61,6 +61,19 @@ Query ──► ① L3 强力置顶捞取（pinned=1，按 importance 排序，�
   主记忆流程**永不阻断**（`fail-open` 默认开启，宁多记不丢记忆）；
 - **判官模型**：默认 `jev`，`api_base` / `api_key` 留空时自动复用 `summarizer.*` 凭证，无需重复填写。
 
+### 1.6 方案 A 止血热修（稳定性加固）
+
+针对上线风险清单做了 6 项根治，全部有 Stage 6 专项用例锁定：
+
+| 编号 | 风险 | 修复要点 |
+| :-- | :-- | :-- |
+| **R-01** | 置顶记忆被误杀 | L3 `pinned=1` 拥有免死金牌：规则层跳过置顶候选，软废弃 SQL 追加 `AND COALESCE(pinned,0)=0` |
+| **R-02** | 未满阈值对话蒸发 | `enqueue_dialogue` 即**实时落盘 L1**；析出 L2 后回写 `l2_processed`；新增 idle 超时自动刷盘 |
+| **R-03** | N+1 调用账单风暴 | N 轮合并为**一个 Context Window**：1 次事实抽取 + 1 次门禁 + 1 次批量 Embedding |
+| **R-04** | 跨群/私聊串台 | `strict_session_isolation` **默认开启**，仅 `scope_key='global'` 允许全局召回 |
+| **R-05** | 检索抢 SQLite 写锁 | 检索链路纯读，命中计数内存累加 + 异步定期刷盘（`close()` 兜底刷净） |
+| **R-06** | 频繁 TLS 握手 | Embedding / Rerank / 判官 / 总结均复用持久 `aiohttp.ClientSession` 连接池 |
+
 ## 2. 架构与数据流
 
 ```text
@@ -221,6 +234,7 @@ Query ──► ① L3 强力置顶捞取（pinned=1，按 importance 排序，�
 | `enable_memory` | bool | `true` | 分层记忆总开关（关闭则不启 Worker、不记录、不注入） |
 | `db_path` | string | `''` | 记忆数据库路径。留空→插件数据目录；填目录→目录下 `agent_memory.db`；填文件→直接使用 |
 | `summary_turn_interval` | int | `5` | 多轮缓冲打包阈值（轮） |
+| `summary_idle_flush_seconds` | int | `180` | 会话静默超时自动刷盘（0 关闭），防止尾部轮次长期滞留内存 |
 | `summarizer_queue_maxsize` | int | `1000` | 后台消费队列容量，满则降级写 DLQ |
 | `memory_injection_enable` | bool | `true` | 注入开关，独立于总开关 |
 
@@ -261,6 +275,9 @@ Query ──► ① L3 强力置顶捞取（pinned=1，按 importance 排序，�
 | `retrieval.prompt_injection_max_chars` | `2000` | 注入字符上限 |
 | `retrieval.retrieve_timeout` | `3.0` | 前置检索超时（超时即放弃注入） |
 | `retrieval.record_dedup_window` | `2.0` | 轮次记录去重时间窗（秒） |
+| `retrieval.strict_session_isolation` | `true` | **严格会话隔离**：仅本会话 + `scope_key='global'` 可召回，物理杜绝串台 |
+| `retrieval.access_flush_interval` | `60.0` | 访问计数异步刷盘间隔（秒），检索链路保持纯读 |
+| `retrieval.access_flush_threshold` | `200` | 访问计数累计达到该条数立即异步刷盘 |
 
 ### 迁移（`migration.*`）
 
@@ -283,6 +300,7 @@ python3 tests/test_stage2_hooks.py       # 双向钩子装配 / 注入 / 记录 
 python3 tests/test_stage3_commands.py    # 三态注入路由 / 四指令 / 指令组装配
 python3 tests/test_stage4_e2e.py         # 全链路端到端闭环 + 冷重启持久化
 python3 tests/test_stage5_evaluator_gate.py  # 判定门禁：价值打分 / 冲突废弃 / 超时降级
+python3 tests/test_stage6_hardening.py   # 方案A 止血热修：R-01 ~ R-06 六项专项
 ```
 
 ### 覆盖矩阵
@@ -294,6 +312,7 @@ python3 tests/test_stage5_evaluator_gate.py  # 判定门禁：价值打分 / 冲
 | **Stage 3** | `system_head`/`system_tail`/`user_head` 三态路由与别名归一化、`cmd_status`/`cmd_recall`/`cmd_pin`/`cmd_migrate` 输出与边界零异常、指令组装配 |
 | **Stage 4** | ① Worker 启动 → ② 5 轮真实钩子触发 batch → ③ L1 落库 + L2 沉淀 + L3 晋升（DLQ=0）→ ④ 两阶段检索注入 L3+L2 → ⑤ 三指令真实读写联动（`pin` 可逆切换并用 `status` 交叉验证）→ ⑥ `terminate()` 尾部冲洗/Worker 回收/连接关闭/数据无损；外加**冷重启复用同一库仍可召回** |
 | **Stage 5** | 判官默认模型 `jev` 与凭证回退、寒暄/纯提问过滤、否定极性翻转与推翻标记识别、判官成功路径（阈值过滤 + 非法 `conflict_id` 过滤）、非法 JSON/连接异常/超时三种降级、`enable=false` 放行、端到端“判官不可用仍入库”、端到端“旧事实软废弃且检索不召回”、融合场景不自我废弃 |
+| **Stage 6** | **R-01** 置顶免死（规则层豁免 + SQL 守卫 + 端到端不废弃）、**R-02** L1 实时落盘/`l2_processed` 回写/idle 超时刷盘、**R-03** 5 轮仅 1 次 LLM+1 次门禁+1 次批量 Embedding、**R-04** 默认严格隔离（跨会话不可见、`global` 例外）、**R-05** 检索不写库/异步刷盘/`close()` 刷净、**R-06** Session 复用与幂等 `close()` |
 
 ### Stage 4 实测闭环指标
 
@@ -305,7 +324,7 @@ python3 tests/test_stage5_evaluator_gate.py  # 判定门禁：价值打分 / 冲
 [⑤-1 OK] /memory status 输出正常（体量与数据库一致）
 [⑤-2 OK] /memory recall 输出正常（含 L3 置顶 + L2 精排分数）
 [⑤-3 OK] /memory pin 状态切换可逆 | L3 总数 3→4→3
-[⑥ OK] 优雅停机完成 | 尾部冲洗 2 轮 | L1 5→7 · L2 5→7 · DLQ=0
+[⑥ OK] 优雅停机完成 | 尾部冲洗 2 轮 | L1 7→7（实时落盘） · L2 5→7 · DLQ=0
 [闭环 OK] 冷重启持久化验证通过 | 复用 5 条 L2 记忆
 [闭环 OK] 二次停机后资源同样完全释放
 ```
@@ -320,6 +339,8 @@ python3 tests/test_stage5_evaluator_gate.py  # 判定门禁：价值打分 / 冲
 | **Stage 2** | `feat(stage2)` | 双向 LLM 钩子装配（注入 + 记录）、静默降级与幂等保护 |
 | **Stage 3** | `feat(stage3)` | 三态动态注入路由、完整 `/memory` 管理指令组（status / recall / pin / migrate） |
 | **Stage 4** | `feat(stage4)` | 全链路端到端集成测试、README 文档收口、首个可发布版本 |
+| **Stage 5** | `feat(stage5)` | 自作判定门禁：廉价判官 `jev`、价值打分、冲突软废弃与平滑降级 |
+| **方案 A** | `fix(hardening)` | 止血热修 R-01 ~ R-06：置顶免死、真批量合并、L1 实时落盘、默认严格隔离、连接池复用、检索纯读 |
 
 ---
 

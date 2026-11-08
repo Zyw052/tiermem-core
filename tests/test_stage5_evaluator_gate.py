@@ -438,23 +438,25 @@ async def test_e2e_fallback_does_not_block() -> None:
 
 
 async def test_e2e_conflict_supersede_and_retrieval() -> None:
+    """非置顶旧事实被推翻 → 软废弃 + 检索不再召回（置顶免死由 Stage6 专项覆盖）。"""
     with tempfile.TemporaryDirectory(prefix="eval_e2e_conflict_") as tmp:
         sm = _new_summarizer(
             Path(tmp), evaluator_cfg={}, embedding_client=ZeroEmbeddingClient()
         )
 
-        # 第一轮：写入旧偏好
-        await sm.process_dialogue("s_conf", "我喜欢喝绿茶", "记住了")
+        # 第一轮：写入旧事实（刻意不含 L3 置顶关键词，确保 pinned=0 可被推翻）
+        await sm.process_dialogue("s_conf", "我住在北京", "记住了")
         conn = sm.storage.connect()
         old = conn.execute(
-            "SELECT atom_id, content, status FROM l2_atoms WHERE scope_key = ? AND content LIKE '%绿茶%'",
+            "SELECT atom_id, content, status, pinned FROM l2_atoms WHERE scope_key = ? AND content LIKE '%北京%'",
             ("s_conf",),
         ).fetchone()
         assert old is not None, "旧事实应已写入"
         assert str(old["status"]) == "active"
+        assert int(old["pinned"]) == 0, "本用例要求旧事实为非置顶，否则应触发免死金牌"
 
-        # 第二轮：明确推翻（否定极性翻转）
-        await sm.process_dialogue("s_conf", "我不喜欢喝绿茶，我现在喜欢喝乌龙茶", "已更新")
+        # 第二轮：明确推翻（搬家 + 不再是）
+        await sm.process_dialogue("s_conf", "我已经搬家到上海了，不再是北京", "已更新")
 
         conn = sm.storage.connect()
         old_after = conn.execute(
@@ -466,7 +468,7 @@ async def test_e2e_conflict_supersede_and_retrieval() -> None:
         assert int(old_after["pinned"]) == 0
 
         new_row = conn.execute(
-            "SELECT atom_id, content, status FROM l2_atoms WHERE scope_key = ? AND content LIKE '%乌龙茶%'",
+            "SELECT atom_id, content, status FROM l2_atoms WHERE scope_key = ? AND content LIKE '%上海%'",
             ("s_conf",),
         ).fetchone()
         assert new_row is not None, "新事实应写入"
@@ -483,10 +485,10 @@ async def test_e2e_conflict_supersede_and_retrieval() -> None:
             rerank_client=None,
             config={"top_k": 10, "recall_pool_limit": 100},
         )
-        result = await retriever.retrieve("我喜欢喝什么茶", session_id="s_conf", top_k=10)
+        result = await retriever.retrieve("我住在哪个城市", session_id="s_conf", top_k=10)
         all_contents = [i.get("content", "") for i in result.get("retrieved_l2", [])]
         all_contents += [i.get("content", "") for i in result.get("pinned_l3", [])]
-        assert not any("我不喜欢喝绿茶" == c for c in all_contents), all_contents
+        assert not any("我住在北京" == c for c in all_contents), all_contents
         print(f"[OK] 检索器已排除被废弃事实；当前召回: {all_contents}")
 
 

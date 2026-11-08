@@ -392,6 +392,17 @@ class EvaluatorGate:
         )
 
         self._llm_client = llm_client
+        # R-06：判官默认走持久连接池，避免每次裁决重建 Session
+        self._http: Optional[Any] = None
+        try:
+            from .models_client import _HttpSessionOwner  # 复用同一套连接池实现
+        except ImportError:  # pragma: no cover - 兼容脚本式导入
+            try:
+                from models_client import _HttpSessionOwner  # type: ignore
+            except ImportError:
+                _HttpSessionOwner = None  # type: ignore
+        if _HttpSessionOwner is not None:
+            self._http = _HttpSessionOwner(self.timeout_seconds)
 
         # ---- 运行期统计（仅可观测性）----
         self.stats: Dict[str, Any] = {
@@ -494,6 +505,10 @@ class EvaluatorGate:
             atom_id = str(cand.get("atom_id") or cand.get("id") or "").strip()
             old_text = str(cand.get("content") or cand.get("fact") or "").strip()
             if not atom_id or not old_text:
+                continue
+            # R-01 修复：L3 置顶记忆拥有“免死金牌”，规则层不得将其判为冲突/推翻目标。
+            # 置顶代表用户明确要求长期记住的核心偏好或硬约束，任何自动判决都无权推翻。
+            if int(cand.get("pinned") or 0) == 1:
                 continue
             if _normalize_text(old_text) == _normalize_text(new_text):
                 continue  # 完全相同不算冲突，交给余弦去重融合
@@ -616,7 +631,24 @@ class EvaluatorGate:
             "temperature": 0.0,
         }
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        # R-06：优先复用持久连接池；极少数场景（未成功装配）才回退临时 Session
+        if self._http is not None:
+            session = await self._http.get()
+            async with session.post(
+                endpoint, headers=headers, json=payload, timeout=timeout
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RuntimeError(f"judge http {resp.status}: {body[:200]}")
+                data = await resp.json()
+                return (
+                    data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    or ""
+                )
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:  # pragma: no cover
             async with session.post(endpoint, headers=headers, json=payload) as resp:
                 if resp.status != 200:
                     body = await resp.text()
@@ -628,6 +660,11 @@ class EvaluatorGate:
                     .get("content", "")
                     or ""
                 )
+
+    async def close(self) -> None:
+        """释放判官 HTTP 连接池（插件停用 / 测试清理时调用）。"""
+        if self._http is not None:
+            await self._http.close()
 
     def _build_prompt(
         self,

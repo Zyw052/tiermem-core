@@ -674,10 +674,14 @@ async def test_full_pipeline_e2e() -> None:
             assert plugin.summarizer.pending_turns() == 0, "停机后缓冲池仍有残留轮次"
             assert plugin.summarizer._queue.qsize() == 0, "停机后消费队列仍有残留任务"
 
-            # 6.2 尾部轮次被冲洗落库（数据无损）
+            # 6.2 尾部轮次已在 enqueue 阶段实时落盘（R-02），停机只是补齐消费
             after_stop = _snapshot_counts(db_path)
-            assert after_stop["l1_docs"] == before_stop["l1_docs"] + len(TAIL_TURNS), (
-                "停机冲洗未把尾部轮次写入 L1：before=%d after=%d"
+            assert before_stop["l1_docs"] == EXPECTED_TURNS + len(TAIL_TURNS), (
+                "R-02：尾部轮次应在 enqueue 时即实时写入 L1，before=%d"
+                % before_stop["l1_docs"]
+            )
+            assert after_stop["l1_docs"] == before_stop["l1_docs"], (
+                "停机过程出现 L1 数据丢失：before=%d after=%d"
                 % (before_stop["l1_docs"], after_stop["l1_docs"])
             )
             assert after_stop["l2_atoms"] >= before_stop["l2_atoms"], "停机过程出现 L2 数据丢失"

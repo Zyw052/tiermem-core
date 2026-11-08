@@ -688,6 +688,14 @@ class AgentMemoryPlugin(Star):
             "summarizer_queue_maxsize": _safe_int(
                 self.config.get("summarizer_queue_maxsize"), 1000, minimum=1
             ),
+            # R-02：idle 超时刷盘（会话静默过久时主动析出缓冲轮次）
+            "summary_idle_flush_seconds": _safe_int(
+                summarizer_cfg.get("idle_flush_seconds"), 180, minimum=0
+            ),
+            # R-06：总结 LLM 连接池超时
+            "llm_timeout": _safe_float(
+                summarizer_cfg.get("timeout_seconds"), 45.0
+            ),
             # 兼容 summarizer.py 现有读取路径（顶层 + summarizer 子节点）
             "llm_api_base": llm_api_base,
             "llm_api_key": llm_api_key,
@@ -734,7 +742,14 @@ class AgentMemoryPlugin(Star):
                 retrieval_cfg.get("recall_pool_limit"), 500, minimum=1
             ),
             "strict_session_isolation": bool(
-                retrieval_cfg.get("strict_session_isolation", False)
+                retrieval_cfg.get("strict_session_isolation", True)
+            ),
+            # R-05：访问计数异步刷盘参数（检索链路保持纯读）
+            "access_flush_interval": _safe_float(
+                retrieval_cfg.get("access_flush_interval"), 60.0
+            ),
+            "access_flush_threshold": _safe_int(
+                retrieval_cfg.get("access_flush_threshold"), 200, minimum=1
             ),
         }
         # 用户配置覆盖默认值
@@ -818,7 +833,26 @@ class AgentMemoryPlugin(Star):
             except Exception as exc:
                 logger.error("[agent_memory] 停止 summarizer 异常: %s", exc, exc_info=True)
 
-        # 3. 关闭存储
+        # 3. 刷盘检索访问计数并释放检索器资源（R-05）
+        if self.retriever is not None:
+            try:
+                await self.retriever.close()
+            except Exception as exc:
+                logger.warning("[agent_memory] 关闭 retriever 异常: %s", exc)
+
+        # 4. 释放模型客户端 HTTP 连接池（R-06）
+        for name, client in (
+            ("embedding_client", self.embedding_client),
+            ("rerank_client", self.rerank_client),
+        ):
+            close_fn = getattr(client, "close", None) if client is not None else None
+            if callable(close_fn):
+                try:
+                    await close_fn()
+                except Exception as exc:
+                    logger.warning("[agent_memory] 关闭 %s 连接池异常: %s", name, exc)
+
+        # 5. 关闭存储
         if self.storage is not None:
             try:
                 self.storage.close()
@@ -835,9 +869,10 @@ class AgentMemoryPlugin(Star):
         self, session_id: str, user_text: str, bot_text: str
     ) -> bool:
         """
-        记录一轮对话到会话缓冲池（达到 N 轮自动打包触发后台总结）。
+        记录一轮对话：实时落盘 L1 + 累积进会话缓冲池（达到 N 轮自动打包总结）。
 
-        说明：缓冲池为纯内存累积，不产生任何阻塞 IO，可安全地在消息链路上调用。
+        说明：L1 为一次极短的本地 SQLite 写入（WAL 模式，微秒级），
+        换来“未满 N 轮即断电/重启也不丢原始对话”的强持久化保证（R-02）。
         """
         if not self.enable_memory or self.summarizer is None:
             return False
@@ -1370,7 +1405,9 @@ class AgentMemoryPlugin(Star):
             return f"{header}\n⚠️ 记忆总开关已关闭（enable_memory=False）。"
 
         try:
-            result = await self.retrieve_memory(q)
+            # R-04：严格会话隔离下，手动 recall 必须带上当前会话上下文，
+            # 否则会退化为“仅全局记忆”，导致用户看不到本会话语境下的召回结果。
+            result = await self.retrieve_memory(q, session_id=_extract_session_id(event))
         except Exception as exc:
             logger.error("[agent_memory] cmd_recall 检索异常: %s", exc, exc_info=True)
             return f"{header}\n❌ 检索异常: {exc}"

@@ -145,6 +145,59 @@ class MemorySummarizer:
         self._stat_turns_buffered: int = 0   # 累计进入缓冲池的轮次
         self._stat_batches_enqueued: int = 0  # 累计打包推入消费队列的批次数
         self._stat_turns_flushed: int = 0    # 累计通过 flush_* 强制触发的轮次
+        # R-03 可观测性：批处理下每批应恰好 +1（用于验证无 N+1 风暴）
+        self._stat_llm_extract_calls: int = 0      # 事实抽取调用次数
+        self._stat_gate_calls: int = 0             # 判定门禁调用次数
+        self._stat_embedding_batch_calls: int = 0  # 批量 Embedding 调用次数
+
+        # ---- R-02：idle 超时刷盘（会话静默过久时主动析出，避免长期滞留内存）----
+        self.idle_flush_seconds: int = self._parse_idle_flush(self.config)
+        self._idle_task: Optional[asyncio.Task] = None
+
+        # ---- R-06：总结 LLM 的持久 HTTP 连接池 ----
+        self.llm_timeout: float = self._parse_llm_timeout(self.config)
+        self._http: Any = None
+        try:
+            try:
+                from .models_client import _HttpSessionOwner
+            except ImportError:  # pragma: no cover - 脚本式导入
+                from models_client import _HttpSessionOwner  # type: ignore
+            self._http = _HttpSessionOwner(self.llm_timeout)
+        except Exception as exc:  # pragma: no cover - 极端兜底
+            logger.warning("[MemorySummarizer] HTTP 连接池初始化失败，将回退临时 Session: %s", exc)
+
+    @staticmethod
+    def _parse_idle_flush(config: Dict[str, Any]) -> int:
+        """
+        解析 idle 刷盘阈值（秒），默认 180 秒；<=0 表示关闭该机制。
+
+        支持顶层 ``summary_idle_flush_seconds`` 与 ``summarizer.idle_flush_seconds``。
+        """
+        candidates: List[Any] = [config.get("summary_idle_flush_seconds")]
+        summarizer_cfg = config.get("summarizer")
+        if isinstance(summarizer_cfg, dict):
+            candidates.append(summarizer_cfg.get("idle_flush_seconds"))
+        for raw in candidates:
+            if raw is None or raw == "":
+                continue
+            try:
+                return max(0, int(raw))
+            except (TypeError, ValueError):
+                continue
+        return 180
+
+    @staticmethod
+    def _parse_llm_timeout(config: Dict[str, Any]) -> float:
+        """解析总结 LLM 超时（秒），默认 20 秒，非法值安全回退。"""
+        raw: Any = config.get("llm_timeout")
+        summarizer_cfg = config.get("summarizer")
+        if raw in (None, "") and isinstance(summarizer_cfg, dict):
+            raw = summarizer_cfg.get("timeout_seconds")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 20.0
+        return value if value > 0 else 20.0
 
     @staticmethod
     def _parse_turn_interval(config: Dict[str, Any]) -> int:
@@ -177,7 +230,17 @@ class MemorySummarizer:
         self._worker_task = asyncio.create_task(
             self._worker_loop(), name="agent_memory_summarizer_worker"
         )
-        logger.info("[MemorySummarizer] Async worker started.")
+        # R-02：启动 idle 超时刷盘守护（0 表示禁用）
+        if self.idle_flush_seconds > 0 and (
+            self._idle_task is None or self._idle_task.done()
+        ):
+            self._idle_task = asyncio.create_task(
+                self._idle_sweeper_loop(), name="agent_memory_idle_sweeper"
+            )
+        logger.info(
+            "[MemorySummarizer] Async worker started (idle_flush=%ss).",
+            self.idle_flush_seconds,
+        )
 
     async def stop(self, flush: bool = True, drain_timeout: float = 5.0) -> None:
         """
@@ -226,20 +289,85 @@ class MemorySummarizer:
                 logger.warning("[MemorySummarizer] Error while stopping worker: %s", exc)
             finally:
                 self._worker_task = None
+
+        # 4. 取消 idle 刷盘守护
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            try:
+                await self._idle_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning("[MemorySummarizer] Error while stopping idle sweeper: %s", exc)
+            finally:
+                self._idle_task = None
+
+        # 5. 释放 HTTP 连接池（R-06）
+        await self.close_http()
+
         logger.info("[MemorySummarizer] Async worker stopped.")
+
+    async def close_http(self) -> None:
+        """释放总结 LLM 连接池与判官连接池（幂等，可重复调用）。"""
+        if self._http is not None:
+            try:
+                await self._http.close()
+            except Exception as exc:  # pragma: no cover
+                logger.warning("[MemorySummarizer] 关闭总结 HTTP 连接池异常: %s", exc)
+        evaluator = getattr(self, "evaluator", None)
+        if evaluator is not None and hasattr(evaluator, "close"):
+            try:
+                await evaluator.close()
+            except Exception as exc:  # pragma: no cover
+                logger.warning("[MemorySummarizer] 关闭判官 HTTP 连接池异常: %s", exc)
+
+    async def _idle_sweeper_loop(self) -> None:
+        """
+        R-02：会话静默超时刷盘守护。
+
+        会话在 ``idle_flush_seconds`` 内没有任何新轮次时，主动把缓冲池中的
+        尾部轮次打包析出，避免“聊了 3 轮就再也没说话”导致记忆长期滞留内存。
+        """
+        interval = max(1.0, float(self.idle_flush_seconds))
+        tick = max(1.0, min(30.0, interval / 2.0))
+        while self._running:
+            try:
+                await asyncio.sleep(tick)
+                if not self._running:
+                    break
+                now = time.time()
+                stale_sessions = [
+                    sid
+                    for sid, turns in list(self._turn_buffers.items())
+                    if turns
+                    and (now - float(turns[0].get("enqueued_at") or now)) >= interval
+                ]
+                for sid in stale_sessions:
+                    flushed = await self.flush_session(sid)
+                    if flushed:
+                        logger.info(
+                            "[MemorySummarizer] idle %.0fs 触发刷盘 session=%s turns=%d",
+                            interval,
+                            sid,
+                            flushed,
+                        )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # pragma: no cover - 守护线程绝不崩溃
+                logger.warning("[MemorySummarizer] idle sweeper 异常（已忽略）: %s", exc)
 
     async def enqueue_dialogue(
         self, session_id: str, user_text: str, assistant_text: str
     ) -> bool:
         """
-        将单轮对话累积进会话缓冲池（零阻塞、零 IO）。
+        将单轮对话实时落盘 L1 并累积进会话缓冲池。
 
         行为：
-        - 每轮先按 session_id 累积到内存缓冲池；
+        - R-02：先同步写入 SQLite ``l1_docs``，未满阈值即断电/重启也不丢原始对话；
+        - 每轮按 session_id 累积到内存缓冲池；
         - 仅当该会话累积轮次达到 summary_turn_interval 时，才把这 N 轮
           打包成一个 batch 事件推入后台总结消费队列，减少 LLM 调用次数；
-        - 不足 N 轮的尾部对话由 flush_session() / flush_all() 强制打包，
-          避免会话结束或插件关闭时丢失记忆。
+        - 不足 N 轮的尾部对话由 flush_session() / flush_all() / idle 超时强制打包。
 
         :param assistant_text: 机器人回复（即 bot_text）
         :return: True 表示该轮已被接受（进入缓冲或成功打包入队）
@@ -250,10 +378,14 @@ class MemorySummarizer:
         if not sid or (not user and not bot):
             return False
 
+        # R-02：先实时落盘 L1 原始轮次，保证“未满 N 轮就断电/重启”也不丢对话
+        l1_doc_id = self._record_l1_dialogue(sid, user, bot, time.time())
+
         turn = {
             "user_text": user,
             "assistant_text": bot,
             "enqueued_at": time.time(),
+            "l1_doc_id": l1_doc_id,
         }
 
         # 关键区内无 await，事件循环内天然原子
@@ -389,6 +521,10 @@ class MemorySummarizer:
             "stat_turns_buffered": self._stat_turns_buffered,
             "stat_batches_enqueued": self._stat_batches_enqueued,
             "stat_turns_flushed": self._stat_turns_flushed,
+            "stat_llm_extract_calls": self._stat_llm_extract_calls,
+            "stat_gate_calls": self._stat_gate_calls,
+            "stat_embedding_batch_calls": self._stat_embedding_batch_calls,
+            "idle_flush_seconds": self.idle_flush_seconds,
             "running": self._running,
         }
 
@@ -425,20 +561,29 @@ class MemorySummarizer:
 
     async def _handle_event(self, event: Dict[str, Any]) -> None:
         """
-        分发单个队列事件：
-        - kind == "batch"：逐轮调用 process_dialogue 处理同一会话的 N 轮对话；
-          单轮失败不阻断整批，失败轮次汇总后统一降级写入 DLQ；
-        - 其他格式（兼容历史的单轮事件）：直接按单轮处理。
+        分发单个队列事件。
+
+        - kind == "batch"：R-03 修复——整批 N 轮合并为**一个 Context Window**，
+          只调用 1 次事实抽取 LLM、1 次判定门禁、1 次批量 Embedding，
+          彻底消除原先 ``for turn in turns`` 的 N+1 调用风暴；
+        - 其他格式（兼容历史的单轮事件）：按单轮批处理路径处理。
         """
         if not isinstance(event, dict):
             logger.warning("[MemorySummarizer] Skip invalid event type: %s", type(event))
             return
 
         if event.get("kind") != "batch":
-            await self.process_dialogue(
+            await self._process_batch(
                 session_id=event.get("session_id", ""),
-                user_text=event.get("user_text", ""),
-                assistant_text=event.get("assistant_text", ""),
+                turns=[
+                    {
+                        "user_text": event.get("user_text", ""),
+                        "assistant_text": event.get("assistant_text", ""),
+                        "enqueued_at": event.get("enqueued_at", time.time()),
+                        "l1_doc_id": event.get("l1_doc_id", ""),
+                    }
+                ],
+                reason="single",
             )
             return
 
@@ -448,46 +593,10 @@ class MemorySummarizer:
             logger.warning("[MemorySummarizer] Skip malformed batch event: %r", event)
             return
 
-        succeeded = 0
-        failed_turns: List[Dict[str, Any]] = []
-        for turn in turns:
-            if not isinstance(turn, dict):
-                continue
-            try:
-                await self.process_dialogue(
-                    session_id=session_id,
-                    user_text=turn.get("user_text", ""),
-                    assistant_text=turn.get("assistant_text", ""),
-                )
-                succeeded += 1
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error(
-                    "[MemorySummarizer] Batch turn failed session=%s: %s",
-                    session_id,
-                    exc,
-                    exc_info=True,
-                )
-                failed_turns.append(turn)
-
-        if failed_turns:
-            self._record_dlq(
-                {
-                    "session_id": session_id,
-                    "turns": failed_turns,
-                    "kind": "batch_partial_failure",
-                    "enqueued_at": event.get("enqueued_at", time.time()),
-                },
-                f"BatchPartialFailure: {len(failed_turns)}/{len(turns)} turn(s) failed",
-            )
-
-        logger.debug(
-            "[MemorySummarizer] Batch done session=%s ok=%d/%d reason=%s",
-            session_id,
-            succeeded,
-            len(turns),
-            event.get("reason", "threshold"),
+        await self._process_batch(
+            session_id=session_id,
+            turns=turns,
+            reason=str(event.get("reason", "threshold") or "threshold"),
         )
 
     def _ensure_storage_columns(self, conn: sqlite3.Connection) -> None:
@@ -527,44 +636,102 @@ class MemorySummarizer:
     def _record_l1_dialogue(
         self, session_id: str, user_text: str, assistant_text: str, now: float
     ) -> str:
-        """记录 L1 原始对话轮次（优先调用 storage 方法，否则安全写入 l1_docs 表）"""
+        """
+        记录 L1 原始对话轮次（R-02：实时落盘，异常安全不阻断主链路）。
+
+        返回 l1_docs.doc_id；写入失败时返回空字符串（调用方仍可继续缓冲/总结）。
+        """
         doc_id = f"l1_{uuid.uuid4().hex[:16]}"
         dialogue_content = f"User: {user_text}\nAssistant: {assistant_text}".strip()
         title = (user_text or assistant_text)[:48].replace("\n", " ")
 
-        if hasattr(self.storage, "record_l1_dialogue") and callable(
-            getattr(self.storage, "record_l1_dialogue")
-        ):
-            self.storage.record_l1_dialogue(session_id, user_text, assistant_text)
-            return doc_id
+        try:
+            if hasattr(self.storage, "record_l1_dialogue") and callable(
+                getattr(self.storage, "record_l1_dialogue")
+            ):
+                self.storage.record_l1_dialogue(session_id, user_text, assistant_text)
+                return doc_id
 
-        conn = self.storage.connect()
-        self._ensure_storage_columns(conn)
-        meta_json = json.dumps(
-            {"user_text": user_text, "assistant_text": assistant_text},
-            ensure_ascii=False,
-        )
-        with conn:
-            conn.execute(
-                """
-                INSERT INTO l1_docs (
-                    doc_id, scope_key, doc_type, title, content,
-                    version, updated_at, created_at,
-                    session_id, importance, metadata
-                ) VALUES (?, ?, 'dialogue_turn', ?, ?, 1, ?, ?, ?, 0.5, ?)
-                """,
-                (
-                    doc_id,
-                    session_id,
-                    title,
-                    dialogue_content,
-                    now,
-                    now,
-                    session_id,
-                    meta_json,
-                ),
+            conn = self.storage.connect()
+            self._ensure_storage_columns(conn)
+            meta_json = json.dumps(
+                {
+                    "user_text": user_text,
+                    "assistant_text": assistant_text,
+                    # 是否已析出为 L2 原子（析出后置 True）
+                    "l2_processed": False,
+                },
+                ensure_ascii=False,
             )
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO l1_docs (
+                        doc_id, scope_key, doc_type, title, content,
+                        version, updated_at, created_at,
+                        session_id, importance, metadata
+                    ) VALUES (?, ?, 'dialogue_turn', ?, ?, 1, ?, ?, ?, 0.5, ?)
+                    """,
+                    (
+                        doc_id,
+                        session_id,
+                        title,
+                        dialogue_content,
+                        now,
+                        now,
+                        session_id,
+                        meta_json,
+                    ),
+                )
+        except Exception as exc:
+            logger.error(
+                "[MemorySummarizer] L1 实时落盘失败 session=%s（不影响后续总结）: %s",
+                session_id,
+                exc,
+                exc_info=True,
+            )
+            return ""
         return doc_id
+
+    def _mark_l1_processed(self, doc_ids: Sequence[str], now: float) -> int:
+        """
+        R-02：L2 析出完成后回写 L1 状态（metadata.l2_processed=True）。
+
+        意义：既能观测“哪些原始轮次已完成沉淀”，也避免重复析出；
+        失败仅记日志，绝不影响已落库的 L2 记忆。
+        """
+        ids = [str(d) for d in (doc_ids or []) if str(d or "").strip()]
+        if not ids:
+            return 0
+        updated = 0
+        try:
+            conn = self.storage.connect()
+            self._ensure_storage_columns(conn)
+            with conn:
+                for doc_id in ids:
+                    row = conn.execute(
+                        "SELECT metadata FROM l1_docs WHERE doc_id = ?", (doc_id,)
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    try:
+                        meta = json.loads(row["metadata"] or "{}")
+                        if not isinstance(meta, dict):
+                            meta = {}
+                    except Exception:
+                        meta = {}
+                    if meta.get("l2_processed") is True:
+                        continue
+                    meta["l2_processed"] = True
+                    meta["l2_processed_at"] = now
+                    conn.execute(
+                        "UPDATE l1_docs SET metadata = ?, updated_at = ? WHERE doc_id = ?",
+                        (json.dumps(meta, ensure_ascii=False), now, doc_id),
+                    )
+                    updated += 1
+        except Exception as exc:
+            logger.debug("[MemorySummarizer] 回写 L1 析出状态失败（忽略）: %s", exc)
+        return updated
 
     @staticmethod
     def _evaluate_pin_and_score(
@@ -584,12 +751,18 @@ class MemorySummarizer:
         return pinned, score, atom_type
 
     def _rule_extract_facts(
-        self, user_text: str, assistant_text: str
+        self, user_text: str, assistant_text: str, max_facts: int = 5
     ) -> List[Dict[str, Any]]:
         """
         100% 健壮的规则分句与关键事实抽取回退器：
         当未配置 LLM 或 LLM 调用异常时，对用户输入与关键回复进行分句、清洗与打分。
+
+        :param max_facts: 单次最多产出事实条数（批处理时按轮数适度放宽）
         """
+        try:
+            limit = max(1, int(max_facts))
+        except (TypeError, ValueError):
+            limit = 5
         candidates: List[str] = []
         raw_parts = re.split(r"[。！？!?\n；;]+", (user_text or "").strip())
         for part in raw_parts:
@@ -610,7 +783,7 @@ class MemorySummarizer:
 
         results: List[Dict[str, Any]] = []
         seen = set()
-        for sent in candidates[:5]:
+        for sent in candidates[:limit]:
             if sent in seen:
                 continue
             seen.add(sent)
@@ -628,10 +801,81 @@ class MemorySummarizer:
     async def _extract_facts(
         self, user_text: str, assistant_text: str
     ) -> List[Dict[str, Any]]:
+        """单轮兼容入口：包装为 Context Window 后转交批量提取。"""
+        context = f"[第1轮] 用户: {user_text}\n[第1轮] 助手: {assistant_text}"
+        return await self._extract_facts_from_context(
+            context=context,
+            merged_user=user_text,
+            merged_assistant=assistant_text,
+            max_facts=5,
+        )
+
+    def _parse_llm_facts(
+        self, content: str, max_facts: int = 5
+    ) -> List[Dict[str, Any]]:
         """
-        提取关键事实：
-        若配置了总结 LLM API (llm_api_base & llm_api_key)，则调用 OpenAI 兼容总结端点；
-        未配置或发生任何异常时，100% 优雅回退到 _rule_extract_facts。
+        解析总结 LLM 返回的 JSON 事实数组（容错 markdown 代码块与前后废话）。
+
+        统一收敛字符串项与对象项两种返回格式，并强制套用 L3 置顶打分规则；
+        任何解析失败都返回空列表，由调用方优雅回退到规则抽取。
+        """
+        text = str(content or "")
+        if not text.strip():
+            return []
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            return []
+        try:
+            parsed = json.loads(match.group(0))
+        except Exception:
+            return []
+        if not isinstance(parsed, list):
+            return []
+
+        facts: List[Dict[str, Any]] = []
+        for item in parsed:
+            if isinstance(item, str) and item.strip():
+                fact_text = item.strip()
+                pinned, score, atom_type = self._evaluate_pin_and_score(fact_text)
+            elif isinstance(item, dict) and item.get("fact"):
+                fact_text = str(item["fact"]).strip()
+                raw_imp = item.get("importance")
+                try:
+                    base = float(raw_imp) if raw_imp is not None else None
+                except (TypeError, ValueError):
+                    base = None
+                pinned, score, atom_type = self._evaluate_pin_and_score(fact_text, base)
+            else:
+                continue
+            if not fact_text:
+                continue
+            facts.append(
+                {
+                    "fact": fact_text,
+                    "importance": score,
+                    "pinned": pinned,
+                    "atom_type": atom_type,
+                }
+            )
+        try:
+            limit = max(1, int(max_facts))
+        except (TypeError, ValueError):
+            limit = 5
+        return facts[:limit]
+
+    async def _extract_facts_from_context(
+        self,
+        context: str,
+        merged_user: str,
+        merged_assistant: str,
+        max_facts: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        从一个完整 Context Window 中一次性提取关键事实（R-03 核心）。
+
+        - 配置了总结 LLM 时：**仅 1 次** /chat/completions 调用，上下文内含全部 N 轮；
+        - 未配置或发生任何异常时：100% 优雅回退到规则分句（使用合并后的原文）；
+        - 该函数在任何异常下都不会抛给调用方，保证记忆主链路不阻断。
         """
         summarizer_cfg = self.config.get("summarizer", {})
         if not isinstance(summarizer_cfg, dict):
@@ -661,10 +905,10 @@ class MemorySummarizer:
                 else f"{api_base}/chat/completions"
             )
             prompt = (
-                "请从以下对话中提取值得长期记住的客观事实、用户偏好、习惯或约束。"
+                "请从以下多轮对话中提取值得长期记住的客观事实、用户偏好、习惯或约束。"
                 "返回 JSON 数组，每项格式为: "
                 '{"fact": "简洁事实陈述", "importance": 0.0到1.0之间的小数}。\n'
-                f"用户: {user_text}\n助手: {assistant_text}"
+                f"{context}"
             )
             headers = {
                 "Content-Type": "application/json",
@@ -677,8 +921,12 @@ class MemorySummarizer:
             }
             try:
                 client_timeout = aiohttp.ClientTimeout(total=timeout_sec)
-                async with aiohttp.ClientSession(timeout=client_timeout) as session:
-                    async with session.post(endpoint, headers=headers, json=payload) as resp:
+                # R-06：复用持久连接池；仅连接池不可用时才回退临时 Session
+                if self._http is not None:
+                    session = await self._http.get()
+                    async with session.post(
+                        endpoint, headers=headers, json=payload, timeout=client_timeout
+                    ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             content = (
@@ -686,47 +934,33 @@ class MemorySummarizer:
                                 .get("message", {})
                                 .get("content", "")
                             )
-                            match = re.search(r"\[.*\]", content, re.DOTALL)
-                            if match:
-                                parsed = json.loads(match.group(0))
-                                if isinstance(parsed, list) and parsed:
-                                    llm_facts: List[Dict[str, Any]] = []
-                                    for item in parsed:
-                                        if isinstance(item, str) and item.strip():
-                                            f_text = item.strip()
-                                            p, s, atype = self._evaluate_pin_and_score(f_text)
-                                            llm_facts.append(
-                                                {
-                                                    "fact": f_text,
-                                                    "importance": s,
-                                                    "pinned": p,
-                                                    "atom_type": atype,
-                                                }
-                                            )
-                                        elif isinstance(item, dict) and item.get("fact"):
-                                            f_text = str(item["fact"]).strip()
-                                            raw_imp = item.get("importance")
-                                            p, s, atype = self._evaluate_pin_and_score(
-                                                f_text,
-                                                float(raw_imp) if raw_imp is not None else None,
-                                            )
-                                            llm_facts.append(
-                                                {
-                                                    "fact": f_text,
-                                                    "importance": s,
-                                                    "pinned": p,
-                                                    "atom_type": atype,
-                                                }
-                                            )
-                                    if llm_facts:
-                                        return llm_facts
+                            llm_facts = self._parse_llm_facts(content, max_facts)
+                            if llm_facts:
+                                return llm_facts
+                else:  # pragma: no cover - 连接池初始化失败的极端兜底
+                    async with aiohttp.ClientSession(timeout=client_timeout) as session:
+                        async with session.post(
+                            endpoint, headers=headers, json=payload
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                content = (
+                                    data.get("choices", [{}])[0]
+                                    .get("message", {})
+                                    .get("content", "")
+                                )
+                                llm_facts = self._parse_llm_facts(content, max_facts)
+                                if llm_facts:
+                                    return llm_facts
             except Exception as exc:
                 logger.warning(
                     "[MemorySummarizer] LLM fact extraction failed, falling back to rules: %s",
                     exc,
                 )
 
-        return self._rule_extract_facts(user_text, assistant_text)
+        return self._rule_extract_facts(
+            merged_user, merged_assistant, max_facts=max_facts
+        )
 
     def _upsert_l2_atom(
         self,
@@ -986,6 +1220,14 @@ class MemorySummarizer:
                             atom_id,
                         )
                         continue
+                    # R-01：置顶记忆（pinned=1）拥有免死金牌，判官/规则均无权软废弃
+                    if int(item.get("pinned") or 0) == 1:
+                        logger.info(
+                            "[MemorySummarizer] 冲突目标为 L3 置顶记忆，已拒绝废弃 atom=%s reason=%s",
+                            atom_id,
+                            item.get("reason", ""),
+                        )
+                        continue
                     replacement = fact_atom_map.get(
                         _normalize_fact_key(item.get("fact", "")), ""
                     )
@@ -1001,6 +1243,7 @@ class MemorySummarizer:
                             updated_at = ?
                         WHERE atom_id = ?
                           AND COALESCE(status, 'active') != 'superseded'
+                          AND COALESCE(pinned, 0) = 0
                         """,
                         (replacement, now, now, atom_id),
                     )
@@ -1020,72 +1263,203 @@ class MemorySummarizer:
             )
         return applied
 
+    @staticmethod
+    def _build_merged_context(
+        turns: Sequence[Dict[str, Any]]
+    ) -> Tuple[str, str, str]:
+        """
+        把 N 轮对话合并为一个统一 Context Window（R-03）。
+
+        返回 ``(merged_user, merged_assistant, context)``：
+        - merged_user / merged_assistant 用「。」拼接，供规则分句回退精确保留每轮语义；
+        - context 带轮次标号，供 LLM 一次性阅读完整对话。
+        """
+        user_parts: List[str] = []
+        assistant_parts: List[str] = []
+        context_lines: List[str] = []
+        for idx, turn in enumerate(turns, start=1):
+            user = str(turn.get("user_text") or "").strip()
+            assistant = str(turn.get("assistant_text") or "").strip()
+            if user:
+                user_parts.append(user)
+            if assistant:
+                assistant_parts.append(assistant)
+            context_lines.append(f"[第{idx}轮] 用户: {user or '（空）'}")
+            if assistant:
+                context_lines.append(f"[第{idx}轮] 助手: {assistant}")
+        return "。".join(user_parts), "。".join(assistant_parts), "\n".join(context_lines)
+
+    async def _embed_texts_batch(self, texts: Sequence[str]) -> List[List[float]]:
+        """
+        单次批量获取 Embedding（R-03：消除逐条请求）。
+
+        仅当客户端不支持 ``get_embeddings`` 或批量调用异常时，才降级为逐条请求
+        （此时向量质量不变，只是延迟变差，属于可用性兜底）。
+        """
+        clean = [str(t or "").strip() for t in texts]
+        if not clean:
+            return []
+        if self.embedding_client is None:
+            return [[] for _ in clean]
+
+        batch_api = getattr(self.embedding_client, "get_embeddings", None)
+        if callable(batch_api):
+            try:
+                self._stat_embedding_batch_calls += 1
+                vectors = await batch_api(clean)
+                if isinstance(vectors, list) and len(vectors) == len(clean):
+                    return vectors
+                logger.warning(
+                    "[MemorySummarizer] 批量 Embedding 数量不匹配 (got=%s want=%d)，降级逐条。",
+                    len(vectors) if isinstance(vectors, list) else type(vectors).__name__,
+                    len(clean),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[MemorySummarizer] 批量 Embedding 失败，降级逐条: %s", exc
+                )
+
+        fallback: List[List[float]] = []
+        for text in clean:
+            try:
+                fallback.append(await self.embedding_client.get_embedding(text))
+            except Exception as exc:
+                logger.debug("[MemorySummarizer] 单条 Embedding 失败（忽略）: %s", exc)
+                fallback.append([])
+        return fallback
+
     async def process_dialogue(
         self, session_id: str, user_text: str, assistant_text: str
     ) -> None:
         """
-        处理单轮对话事件：
-        1. L1 记录原始对话轮次；
-        2. 提取关键句/事实（LLM 总结或规则分句优雅回退）；
-        3. 调用 embedding_client.get_embedding(fact) 向量化并与 L2 记忆余弦相似度 (>0.88) 融合去重；
-        4. 包含偏好/习惯/核心约束关键词或评分 >= 0.85 时标记 pinned=1 晋升 L3；
-        5. 全流程 try-except 兜底，异常记录 error 并写入 DLQ，绝不崩溃 Worker。
+        单轮兼容入口（保持既有调用契约，内部统一走批处理路径）。
+
+        异常全部在 ``_process_batch`` 内消化并落 DLQ，本方法不会向外抛出。
+        """
+        await self._process_batch(
+            session_id=session_id,
+            turns=[
+                {
+                    "user_text": user_text,
+                    "assistant_text": assistant_text,
+                    "enqueued_at": time.time(),
+                }
+            ],
+            reason="single",
+        )
+
+    async def _process_batch(
+        self,
+        session_id: str,
+        turns: Sequence[Dict[str, Any]],
+        reason: str = "threshold",
+    ) -> None:
+        """
+        批处理核心（R-03）：N 轮对话 → 1 个 Context Window → 1 次 LLM + 1 次门禁 + 1 次批量向量。
+
+        处理链路：
+        1. L1：复用 enqueue 阶段已实时落盘的 doc_id，缺失时补写（兼容直连调用）；
+        2. 合并 N 轮为统一上下文，**只调用一次** ``_extract_facts_from_context``；
+        3. **只调用一次** ``_run_evaluator_gate``（价值过滤 + 冲突检测）；
+        4. **只调用一次** 批量 Embedding，再逐条做 L2 相似度融合/新建；
+        5. 冲突软废弃（置顶记忆受免死金牌保护）；
+        6. 回写 L1 析出状态。
+        全链路异常兜底：失败整批写入 task_dlq，绝不崩溃 Worker。
         """
         clean_session = str(session_id or "").strip()
-        clean_user = str(user_text or "").strip()
-        clean_assistant = str(assistant_text or "").strip()
-        if not clean_session or (not clean_user and not clean_assistant):
+        norm_turns: List[Dict[str, Any]] = []
+        for turn in turns or []:
+            if not isinstance(turn, dict):
+                continue
+            user = str(turn.get("user_text") or "").strip()
+            assistant = str(turn.get("assistant_text") or "").strip()
+            if not user and not assistant:
+                continue
+            norm_turns.append(
+                {
+                    "user_text": user,
+                    "assistant_text": assistant,
+                    "enqueued_at": float(turn.get("enqueued_at") or time.time()),
+                    "l1_doc_id": str(turn.get("l1_doc_id") or "").strip(),
+                }
+            )
+
+        if not clean_session or not norm_turns:
             return
 
         now = time.time()
-        payload = {
+        payload: Dict[str, Any] = {
+            "kind": "batch",
             "session_id": clean_session,
-            "user_text": clean_user,
-            "assistant_text": clean_assistant,
-            "processed_at": now,
+            "turns": norm_turns,
+            "reason": reason,
+            "enqueued_at": now,
         }
 
         try:
-            # 1. L1 记录原始对话轮次
-            l1_doc_id = self._record_l1_dialogue(
-                clean_session, clean_user, clean_assistant, now
-            )
+            # ---- 1. L1：复用实时落盘记录，缺失则补写 ----
+            l1_doc_ids: List[str] = []
+            for turn in norm_turns:
+                doc_id = turn.get("l1_doc_id") or ""
+                if not doc_id:
+                    doc_id = self._record_l1_dialogue(
+                        clean_session,
+                        turn["user_text"],
+                        turn["assistant_text"],
+                        now,
+                    )
+                    turn["l1_doc_id"] = doc_id
+                if doc_id:
+                    l1_doc_ids.append(doc_id)
 
-            # 2. 提取关键事实（LLM 或规则回退）
-            facts = await self._extract_facts(clean_user, clean_assistant)
+            # ---- 2. 合并上下文 + 单次事实抽取 ----
+            merged_user, merged_assistant, context = self._build_merged_context(norm_turns)
+            max_facts = max(5, min(2 * len(norm_turns), 20))
+            self._stat_llm_extract_calls += 1
+            facts = await self._extract_facts_from_context(
+                context=context,
+                merged_user=merged_user,
+                merged_assistant=merged_assistant,
+                max_facts=max_facts,
+            )
             if not facts:
+                self._mark_l1_processed(l1_doc_ids, now)
                 return
 
-            # 2.5 自作判定门禁：信息价值过滤 + 冲突检测（失败自动降级，不阻断）
+            # ---- 3. 单次判定门禁 ----
+            self._stat_gate_calls += 1
             gate_report = await self._run_evaluator_gate(clean_session, facts, now)
             if gate_report is not None:
                 facts = gate_report.kept
 
-            if not facts:
+            valid_facts = [
+                item for item in facts if str(item.get("fact", "")).strip()
+            ]
+            if not valid_facts:
                 logger.debug(
-                    "[MemorySummarizer] 判定门禁过滤后无有效事实 session=%s（dropped=%s）",
+                    "[MemorySummarizer] 门禁过滤后无有效事实 session=%s turns=%d dropped=%s",
                     clean_session,
+                    len(norm_turns),
                     len(gate_report.dropped) if gate_report else 0,
                 )
+                self._mark_l1_processed(l1_doc_ids, now)
                 return
 
-            # 3. 逐条事实向量化、L2 余弦相似度去重融合与 L3 置顶判定
+            # ---- 4. 单次批量向量化 ----
+            fact_texts = [str(item.get("fact", "")).strip() for item in valid_facts]
+            embeddings = await self._embed_texts_batch(fact_texts)
+
+            # ---- 5. 逐条 L2 融合/新建 ----
             fact_atom_map: Dict[str, str] = {}
-            for item in facts:
-                fact_text = str(item.get("fact", "")).strip()
-                if not fact_text:
-                    continue
-
-                if self.embedding_client is not None:
-                    embedding_vec = await self.embedding_client.get_embedding(fact_text)
-                else:
-                    embedding_vec = []
-
+            source_doc_id = l1_doc_ids[0] if l1_doc_ids else ""
+            for idx, item in enumerate(valid_facts):
+                fact_text = fact_texts[idx]
+                embedding_vec = embeddings[idx] if idx < len(embeddings) else []
                 atom_id, merged = self._upsert_l2_atom(
                     session_id=clean_session,
                     fact_item=item,
                     embedding_vec=embedding_vec,
-                    source_doc_id=l1_doc_id,
+                    source_doc_id=source_doc_id,
                     now=now,
                 )
                 fact_atom_map[_normalize_fact_key(fact_text)] = atom_id
@@ -1098,7 +1472,7 @@ class MemorySummarizer:
                     item.get("value_score"),
                 )
 
-            # 3.5 应用冲突判定：把被推翻的旧事实软废弃（superseded）
+            # ---- 6. 冲突软废弃（置顶免死）----
             if gate_report is not None and gate_report.conflicts:
                 applied = self._apply_conflict_resolution(
                     gate_report.conflicts, fact_atom_map, now
@@ -1109,9 +1483,23 @@ class MemorySummarizer:
                     len(gate_report.conflicts),
                     applied,
                 )
+
+            # ---- 7. 回写 L1 析出状态 ----
+            self._mark_l1_processed(l1_doc_ids, now)
+
+            logger.debug(
+                "[MemorySummarizer] Batch done session=%s turns=%d facts=%d reason=%s",
+                clean_session,
+                len(norm_turns),
+                len(valid_facts),
+                reason,
+            )
+        except asyncio.CancelledError:
+            # 交给 _worker_loop 统一记录一次 DLQ，避免重复写入
+            raise
         except Exception as exc:
             logger.error(
-                "[MemorySummarizer] process_dialogue error for session=%s: %s",
+                "[MemorySummarizer] process batch error for session=%s: %s",
                 clean_session,
                 exc,
                 exc_info=True,

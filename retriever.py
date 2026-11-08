@@ -10,6 +10,7 @@ astrbot_plugin_agent_memory - 两阶段混合检索引擎 (retriever.py)
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -101,6 +102,34 @@ class MemoryRetriever:
         self.config: Dict[str, Any] = config if isinstance(config, dict) else {}
         self._schema_checked: bool = False
 
+        # ---- R-05：访问计数改为内存累加 + 异步定期刷盘 ----
+        # 检索是高频只读链路，任何同步 UPDATE 都会抢 SQLite 写锁并拖慢首字延迟。
+        self._access_counter: Dict[str, int] = {}
+        self._access_last_flush: float = time.time()
+        try:
+            self._access_flush_interval: float = max(
+                1.0, float(self.config.get("access_flush_interval", 60.0) or 60.0)
+            )
+        except (TypeError, ValueError):
+            self._access_flush_interval = 60.0
+        try:
+            self._access_flush_threshold: int = max(
+                1, int(self.config.get("access_flush_threshold", 200) or 200)
+            )
+        except (TypeError, ValueError):
+            self._access_flush_threshold = 200
+        self._access_flush_task: Optional[asyncio.Task] = None
+        self._stat_access_buffered: int = 0
+        self._stat_access_flushed: int = 0
+
+    def _strict_isolation(self) -> bool:
+        """
+        R-04：是否开启严格会话隔离（默认 True）。
+
+        默认物理隔离不同群聊/私聊；仅当明确 ``scope_key='global'`` 的记忆才允许跨会话召回。
+        """
+        return bool(self.config.get("strict_session_isolation", True))
+
     def _ensure_storage_columns(self, conn: sqlite3.Connection) -> None:
         """幂等检查并补齐 l2_atoms 表的扩展字段（pinned, tier, atom_type 等）。"""
         if self._schema_checked:
@@ -183,34 +212,69 @@ class MemoryRetriever:
         seen_contents: set[str] = set()
 
         try:
+            strict_session = self._strict_isolation()
             if session_id and str(session_id).strip():
                 clean_sid = str(session_id).strip()
-                cur = conn.execute(
-                    """
-                    SELECT *
-                    FROM l2_atoms
-                    WHERE (pinned = 1 OR tier >= 3)
-                      AND COALESCE(status, 'active') != 'superseded'
-                    ORDER BY
-                        CASE WHEN scope_key = ? OR session_id = ? THEN 0 ELSE 1 END ASC,
-                        importance DESC,
-                        updated_at DESC
-                    LIMIT ?
-                    """,
-                    (clean_sid, clean_sid, int(max_pinned)),
-                )
+                if strict_session:
+                    # R-04：严格隔离下仅召回本会话置顶 + 显式 global 全局置顶
+                    cur = conn.execute(
+                        """
+                        SELECT *
+                        FROM l2_atoms
+                        WHERE (pinned = 1 OR tier >= 3)
+                          AND COALESCE(status, 'active') != 'superseded'
+                          AND (
+                                scope_key = ?
+                                OR session_id = ?
+                                OR COALESCE(scope_key, '') = 'global'
+                              )
+                        ORDER BY importance DESC, updated_at DESC
+                        LIMIT ?
+                        """,
+                        (clean_sid, clean_sid, int(max_pinned)),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        SELECT *
+                        FROM l2_atoms
+                        WHERE (pinned = 1 OR tier >= 3)
+                          AND COALESCE(status, 'active') != 'superseded'
+                        ORDER BY
+                            CASE WHEN scope_key = ? OR session_id = ? THEN 0 ELSE 1 END ASC,
+                            importance DESC,
+                            updated_at DESC
+                        LIMIT ?
+                        """,
+                        (clean_sid, clean_sid, int(max_pinned)),
+                    )
             else:
-                cur = conn.execute(
-                    """
-                    SELECT *
-                    FROM l2_atoms
-                    WHERE (pinned = 1 OR tier >= 3)
-                      AND COALESCE(status, 'active') != 'superseded'
-                    ORDER BY importance DESC, updated_at DESC
-                    LIMIT ?
-                    """,
-                    (int(max_pinned),),
-                )
+                if strict_session:
+                    # 无会话上下文 + 严格隔离：仅召回显式 global 置顶记忆
+                    cur = conn.execute(
+                        """
+                        SELECT *
+                        FROM l2_atoms
+                        WHERE (pinned = 1 OR tier >= 3)
+                          AND COALESCE(status, 'active') != 'superseded'
+                          AND COALESCE(scope_key, '') = 'global'
+                        ORDER BY importance DESC, updated_at DESC
+                        LIMIT ?
+                        """,
+                        (int(max_pinned),),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        SELECT *
+                        FROM l2_atoms
+                        WHERE (pinned = 1 OR tier >= 3)
+                          AND COALESCE(status, 'active') != 'superseded'
+                        ORDER BY importance DESC, updated_at DESC
+                        LIMIT ?
+                        """,
+                        (int(max_pinned),),
+                    )
 
             for row in cur.fetchall():
                 item = self._row_to_atom_dict(row)
@@ -235,15 +299,20 @@ class MemoryRetriever:
         """加载用于第一阶段粗排的 L2 原子记忆候选池。"""
         pool: List[Dict[str, Any]] = []
         try:
-            strict_session = bool(self.config.get("strict_session_isolation", False))
+            strict_session = self._strict_isolation()
             if session_id and str(session_id).strip():
                 clean_sid = str(session_id).strip()
                 if strict_session:
+                    # R-04：严格隔离（默认）——只允许本会话 + 显式 global 全局记忆
                     cur = conn.execute(
                         """
                         SELECT *
                         FROM l2_atoms
-                        WHERE (scope_key = ? OR session_id = ?)
+                        WHERE (
+                                scope_key = ?
+                                OR session_id = ?
+                                OR COALESCE(scope_key, '') = 'global'
+                              )
                           AND COALESCE(status, 'active') != 'superseded'
                         ORDER BY updated_at DESC
                         LIMIT ?
@@ -264,16 +333,30 @@ class MemoryRetriever:
                         (clean_sid, clean_sid, int(pool_limit)),
                     )
             else:
-                cur = conn.execute(
-                    """
-                    SELECT *
-                    FROM l2_atoms
-                    WHERE COALESCE(status, 'active') != 'superseded'
-                    ORDER BY updated_at DESC
-                    LIMIT ?
-                    """,
-                    (int(pool_limit),),
-                )
+                if strict_session:
+                    # 无会话上下文 + 严格隔离：仅召回显式 global 记忆
+                    cur = conn.execute(
+                        """
+                        SELECT *
+                        FROM l2_atoms
+                        WHERE COALESCE(status, 'active') != 'superseded'
+                          AND COALESCE(scope_key, '') = 'global'
+                        ORDER BY updated_at DESC
+                        LIMIT ?
+                        """,
+                        (int(pool_limit),),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        SELECT *
+                        FROM l2_atoms
+                        WHERE COALESCE(status, 'active') != 'superseded'
+                        ORDER BY updated_at DESC
+                        LIMIT ?
+                        """,
+                        (int(pool_limit),),
+                    )
 
             for row in cur.fetchall():
                 item = self._row_to_atom_dict(row)
@@ -483,28 +566,122 @@ class MemoryRetriever:
 
         return retrieved_l2[: int(top_k)]
 
-    def _touch_accessed_atoms(
-        self, conn: sqlite3.Connection, atom_ids: Sequence[str]
-    ) -> None:
-        """轻量更新被检索命中的记忆原子的访问计数与最后访问时间。"""
-        valid_ids = [str(aid) for aid in atom_ids if aid]
-        if not valid_ids:
+    def _record_access_memory(self, atom_ids: Sequence[str]) -> None:
+        """
+        R-05：把命中记忆的访问计数累加在内存字典里（纯内存、无 IO、无锁）。
+
+        原因：检索是最热的只读链路，同步 UPDATE 会抢 SQLite 写锁，
+        在 WAL 下仍可能与其他写入产生锁竞争，直接抬高首字延迟。
+        """
+        touched = 0
+        for aid in atom_ids:
+            atom_id = str(aid or "").strip()
+            if not atom_id:
+                continue
+            self._access_counter[atom_id] = self._access_counter.get(atom_id, 0) + 1
+            touched += 1
+        if not touched:
             return
-        now = time.time()
+        self._stat_access_buffered += touched
+        if self._should_flush_access():
+            self._schedule_access_flush()
+
+    def _should_flush_access(self) -> bool:
+        """判断内存计数是否达到刷盘条件（阈值或时间窗）。"""
+        if not self._access_counter:
+            return False
+        if sum(self._access_counter.values()) >= self._access_flush_threshold:
+            return True
+        return (time.time() - self._access_last_flush) >= self._access_flush_interval
+
+    def _schedule_access_flush(self) -> None:
+        """异步调度一次刷盘（同一时刻至多一个刷盘 Task，重复触发直接跳过）。"""
+        if self._access_flush_task is not None and not self._access_flush_task.done():
+            return
         try:
-            placeholders = ",".join("?" for _ in valid_ids)
-            with conn:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # 无事件循环（同步上下文）时不刷盘，留给下次或 close()
+            return
+        self._access_flush_task = loop.create_task(
+            self.flush_access_counters(), name="agent_memory_access_flush"
+        )
+
+    def _flush_access_sync(self, batch: Dict[str, int]) -> None:
+        """把一批访问计数增量写回 SQLite（在后台线程执行，不阻塞事件循环）。"""
+        if not batch:
+            return
+        conn = self.storage.connect()
+        now = time.time()
+        with conn:
+            for atom_id, delta in batch.items():
                 conn.execute(
-                    f"""
+                    """
                     UPDATE l2_atoms
-                    SET access_count = access_count + 1,
+                    SET access_count = COALESCE(access_count, 0) + ?,
                         last_accessed_at = ?
-                    WHERE atom_id IN ({placeholders})
+                    WHERE atom_id = ?
                     """,
-                    [now, *valid_ids],
+                    (int(delta), now, atom_id),
                 )
+
+    async def flush_access_counters(self) -> int:
+        """
+        异步刷盘内存中的访问计数（R-05）。
+
+        返回本次成功刷盘的原子条数；失败时把计数回填内存，保证不丢数据。
+        """
+        if not self._access_counter:
+            self._access_last_flush = time.time()
+            return 0
+
+        batch = dict(self._access_counter)
+        self._access_counter.clear()
+
+        try:
+            # SQLite 写入放到线程池，避免检索高峰时阻塞事件循环
+            await asyncio.to_thread(self._flush_access_sync, batch)
+            self._stat_access_flushed += sum(batch.values())
+            self._access_last_flush = time.time()
+            logger.debug(
+                "[MemoryRetriever] 访问计数刷盘完成 atoms=%d deltas=%d",
+                len(batch),
+                sum(batch.values()),
+            )
+            return len(batch)
         except Exception as exc:
-            logger.debug("[MemoryRetriever] 更新记忆访问统计失败（忽略）: %s", exc)
+            logger.debug("[MemoryRetriever] 访问计数刷盘失败，已回填内存（忽略）: %s", exc)
+            for atom_id, delta in batch.items():
+                self._access_counter[atom_id] = self._access_counter.get(atom_id, 0) + delta
+            return 0
+
+    def get_access_stats(self) -> Dict[str, Any]:
+        """返回访问计数缓冲状态（可观测性）。"""
+        return {
+            "pending_atoms": len(self._access_counter),
+            "pending_deltas": sum(self._access_counter.values()),
+            "flush_interval": self._access_flush_interval,
+            "flush_threshold": self._access_flush_threshold,
+            "stat_buffered": self._stat_access_buffered,
+            "stat_flushed": self._stat_access_flushed,
+            "flushing": bool(
+                self._access_flush_task is not None
+                and not self._access_flush_task.done()
+            ),
+        }
+
+    async def close(self) -> None:
+        """停机前把剩余访问计数刷盘并回收刷盘 Task（幂等）。"""
+        task = self._access_flush_task
+        if task is not None and not task.done():
+            try:
+                await task
+            except Exception:  # pragma: no cover - 刷盘失败不影响停机
+                pass
+        self._access_flush_task = None
+        try:
+            await self.flush_access_counters()
+        except Exception as exc:  # pragma: no cover
+            logger.debug("[MemoryRetriever] 停机刷盘异常（忽略）: %s", exc)
 
     @staticmethod
     def _format_prompt_context(
@@ -612,9 +789,9 @@ class MemoryRetriever:
                 top_k=effective_top_k,
             )
 
-            # 更新命中记忆的访问计数
+            # R-05：检索保持纯读，访问计数仅在内存累加，异步定期刷盘
             hit_ids = [item.get("atom_id", "") for item in retrieved_l2 if item.get("atom_id")]
-            self._touch_accessed_atoms(conn, hit_ids)
+            self._record_access_memory(hit_ids)
 
             # 4. 组装 Markdown prompt_context
             prompt_context = self._format_prompt_context(pinned_l3, retrieved_l2)

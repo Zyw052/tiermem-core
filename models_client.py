@@ -30,6 +30,61 @@ except Exception:  # pragma: no cover
     logger = logging.getLogger("astrbot_plugin_agent_memory.models_client")
 
 
+class _HttpSessionOwner:
+    """
+    惰性持有的 aiohttp.ClientSession 连接池（R-06 修复）。
+
+    背景：原实现每次请求都以上下文管理器方式新建 ClientSession，
+    高频 Embedding / Rerank 下产生大量 TCP/TLS 握手开销（N+1 账单与延迟）。
+
+    行为：
+    - 首次使用时创建 Session，后续所有请求复用同一连接池；
+    - 允许外部注入 Session（测试桩 / 宿主统一管理），此时不负责关闭；
+    - ``close()`` 幂等释放，重复调用与未创建场景均安全。
+    """
+
+    def __init__(
+        self,
+        timeout: float,
+        session: Optional["aiohttp.ClientSession"] = None,
+    ) -> None:
+        self._timeout = float(timeout)
+        self._session = session
+        self._owns_session = session is None
+
+    async def get(self) -> "aiohttp.ClientSession":
+        """获取（必要时惰性创建）共享 Session。"""
+        # 外部注入的 Session 优先直接复用，不依赖 aiohttp 是否可导入
+        if self._session is not None and not self._session.closed:
+            return self._session
+        if aiohttp is None:  # pragma: no cover - 依赖缺失时的显式报错
+            raise RuntimeError("aiohttp 不可用，无法创建 HTTP 连接池")
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self._timeout)
+        )
+        self._owns_session = True
+        return self._session
+
+    @property
+    def session(self) -> Optional["aiohttp.ClientSession"]:
+        """当前持有的 Session（可能为 None / 已关闭）。"""
+        return self._session
+
+    async def close(self) -> None:
+        """释放自建 Session；外部注入的 Session 不在此处关闭。"""
+        session = self._session
+        self._session = None
+        if session is None or not self._owns_session:
+            return
+        try:
+            if not session.closed:
+                await session.close()
+        except Exception as exc:  # pragma: no cover - 关闭失败不应影响停机
+            logger.warning("[models_client] 关闭 HTTP 连接池异常（已忽略）: %s", exc)
+        finally:
+            self._owns_session = False
+
+
 def cosine_similarity(vec1: Sequence[float], vec2: Sequence[float]) -> float:
     """
     计算两个向量的余弦相似度（支持 numpy 加速与纯 Python 回退）。
@@ -257,6 +312,7 @@ class EmbeddingClient:
         dim: int = 1024,
         timeout: float = 30.0,
         send_dimensions_param: bool = False,
+        session: Optional["aiohttp.ClientSession"] = None,
     ) -> None:
         if int(dim) <= 0:
             raise ValueError(f"Embedding 维度 dim 必须为正整数，当前收到: {dim}")
@@ -266,6 +322,12 @@ class EmbeddingClient:
         self.dim = int(dim)
         self.timeout = float(timeout)
         self.send_dimensions_param = bool(send_dimensions_param)
+        # R-06：持久连接池，避免每次请求重建 Session
+        self._http = _HttpSessionOwner(self.timeout, session)
+
+    async def close(self) -> None:
+        """释放 HTTP 连接池（插件停用 / 测试清理时调用）。"""
+        await self._http.close()
 
     def zero_vector(self) -> List[float]:
         """生成当前配置维度的安全零向量。"""
@@ -363,37 +425,36 @@ class EmbeddingClient:
             payload["dimensions"] = self.dim
 
         try:
-            client_timeout = aiohttp.ClientTimeout(total=self.timeout)
-            async with aiohttp.ClientSession(timeout=client_timeout) as session:
-                async with session.post(endpoint, headers=headers, json=payload) as resp:
-                    if resp.status != 200:
-                        err_text = await resp.text()
-                        logger.warning(
-                            "[EmbeddingClient] API 请求失败 (HTTP %d): %s",
-                            resp.status,
-                            err_text[:300],
-                        )
-                        return [self.zero_vector() for _ in texts]
-
-                    data = await resp.json()
-                    items = data.get("data", [])
-                    if not isinstance(items, list) or len(items) == 0:
-                        logger.warning("[EmbeddingClient] 响应缺少有效 data 列表，降级返回零向量。")
-                        return [self.zero_vector() for _ in texts]
-
-                    # 按 index 排序保证与输入顺序严格一致
-                    items_sorted = sorted(
-                        items,
-                        key=lambda item: item.get("index", 0) if isinstance(item, dict) else 0,
+            session = await self._http.get()
+            async with session.post(endpoint, headers=headers, json=payload) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    logger.warning(
+                        "[EmbeddingClient] API 请求失败 (HTTP %d): %s",
+                        resp.status,
+                        err_text[:300],
                     )
-                    vectors: List[List[float]] = []
-                    for i in range(len(texts)):
-                        if i < len(items_sorted) and isinstance(items_sorted[i], dict):
-                            raw_emb = items_sorted[i].get("embedding")
-                            vectors.append(self._validate_and_align_vector(raw_emb))
-                        else:
-                            vectors.append(self.zero_vector())
-                    return vectors
+                    return [self.zero_vector() for _ in texts]
+
+                data = await resp.json()
+                items = data.get("data", [])
+                if not isinstance(items, list) or len(items) == 0:
+                    logger.warning("[EmbeddingClient] 响应缺少有效 data 列表，降级返回零向量。")
+                    return [self.zero_vector() for _ in texts]
+
+                # 按 index 排序保证与输入顺序严格一致
+                items_sorted = sorted(
+                    items,
+                    key=lambda item: item.get("index", 0) if isinstance(item, dict) else 0,
+                )
+                vectors: List[List[float]] = []
+                for i in range(len(texts)):
+                    if i < len(items_sorted) and isinstance(items_sorted[i], dict):
+                        raw_emb = items_sorted[i].get("embedding")
+                        vectors.append(self._validate_and_align_vector(raw_emb))
+                    else:
+                        vectors.append(self.zero_vector())
+                return vectors
         except Exception as exc:
             logger.warning("[EmbeddingClient] 调用异常，已安全降级返回零向量: %s", exc)
             return [self.zero_vector() for _ in texts]
@@ -420,6 +481,7 @@ class RerankClient:
         timeout: float = 20.0,
         rrf_k: int = 60,
         embedding_client: Optional[EmbeddingClient] = None,
+        session: Optional["aiohttp.ClientSession"] = None,
     ) -> None:
         self.api_base = (api_base or "").strip().rstrip("/")
         self.api_key = (api_key or "").strip()
@@ -427,6 +489,12 @@ class RerankClient:
         self.timeout = float(timeout)
         self.rrf_k = int(rrf_k)
         self.embedding_client = embedding_client
+        # R-06：持久连接池，避免每次请求重建 Session
+        self._http = _HttpSessionOwner(self.timeout, session)
+
+    async def close(self) -> None:
+        """释放 HTTP 连接池（插件停用 / 测试清理时调用）。"""
+        await self._http.close()
 
     def _build_endpoint(self) -> str:
         """构建 Rerank 完整请求地址（兼容 /rerank 端点）。"""
@@ -500,71 +568,70 @@ class RerankClient:
         }
 
         try:
-            client_timeout = aiohttp.ClientTimeout(total=self.timeout)
-            async with aiohttp.ClientSession(timeout=client_timeout) as session:
-                async with session.post(endpoint, headers=headers, json=payload) as resp:
-                    if resp.status != 200:
-                        err_text = await resp.text()
-                        logger.warning(
-                            "[RerankClient] Rerank API 返回非 200 (HTTP %d)，回退至 RRF: %s",
-                            resp.status,
-                            err_text[:300],
-                        )
-                        return self._fallback_rrf(
-                            query=query,
-                            documents=documents,
-                            top_n=effective_top_n,
-                            query_embedding=query_embedding,
-                            doc_embeddings=doc_embeddings,
-                        )
-
-                    data = await resp.json()
-                    raw_results = data.get("results") or data.get("data") or []
-                    if not isinstance(raw_results, list) or len(raw_results) == 0:
-                        logger.warning("[RerankClient] Rerank 响应无有效 results，回退至 RRF。")
-                        return self._fallback_rrf(
-                            query=query,
-                            documents=documents,
-                            top_n=effective_top_n,
-                            query_embedding=query_embedding,
-                            doc_embeddings=doc_embeddings,
-                        )
-
-                    formatted: List[Dict[str, Any]] = []
-                    for item in raw_results:
-                        if not isinstance(item, dict):
-                            continue
-                        idx = int(item.get("index", -1))
-                        if idx < 0 or idx >= len(documents):
-                            continue
-                        score = float(
-                            item.get(
-                                "relevance_score",
-                                item.get("score", 0.0),
-                            )
-                        )
-                        formatted.append(
-                            {
-                                "index": idx,
-                                "document": documents[idx],
-                                "relevance_score": score,
-                            }
-                        )
-
-                    if not formatted:
-                        return self._fallback_rrf(
-                            query=query,
-                            documents=documents,
-                            top_n=effective_top_n,
-                            query_embedding=query_embedding,
-                            doc_embeddings=doc_embeddings,
-                        )
-
-                    formatted.sort(
-                        key=lambda x: (x["relevance_score"], -x["index"]),
-                        reverse=True,
+            session = await self._http.get()
+            async with session.post(endpoint, headers=headers, json=payload) as resp:
+                if resp.status != 200:
+                    err_text = await resp.text()
+                    logger.warning(
+                        "[RerankClient] Rerank API 返回非 200 (HTTP %d)，回退至 RRF: %s",
+                        resp.status,
+                        err_text[:300],
                     )
-                    return formatted[:effective_top_n]
+                    return self._fallback_rrf(
+                        query=query,
+                        documents=documents,
+                        top_n=effective_top_n,
+                        query_embedding=query_embedding,
+                        doc_embeddings=doc_embeddings,
+                    )
+
+                data = await resp.json()
+                raw_results = data.get("results") or data.get("data") or []
+                if not isinstance(raw_results, list) or len(raw_results) == 0:
+                    logger.warning("[RerankClient] Rerank 响应无有效 results，回退至 RRF。")
+                    return self._fallback_rrf(
+                        query=query,
+                        documents=documents,
+                        top_n=effective_top_n,
+                        query_embedding=query_embedding,
+                        doc_embeddings=doc_embeddings,
+                    )
+
+                formatted: List[Dict[str, Any]] = []
+                for item in raw_results:
+                    if not isinstance(item, dict):
+                        continue
+                    idx = int(item.get("index", -1))
+                    if idx < 0 or idx >= len(documents):
+                        continue
+                    score = float(
+                        item.get(
+                            "relevance_score",
+                            item.get("score", 0.0),
+                        )
+                    )
+                    formatted.append(
+                        {
+                            "index": idx,
+                            "document": documents[idx],
+                            "relevance_score": score,
+                        }
+                    )
+
+                if not formatted:
+                    return self._fallback_rrf(
+                        query=query,
+                        documents=documents,
+                        top_n=effective_top_n,
+                        query_embedding=query_embedding,
+                        doc_embeddings=doc_embeddings,
+                    )
+
+                formatted.sort(
+                    key=lambda x: (x["relevance_score"], -x["index"]),
+                    reverse=True,
+                )
+                return formatted[:effective_top_n]
         except Exception as exc:
             logger.warning("[RerankClient] 请求异常，已优雅降级至 RRF 算法: %s", exc)
             return self._fallback_rrf(
