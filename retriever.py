@@ -114,6 +114,10 @@ class MemoryRetriever:
             ("pinned", "INTEGER NOT NULL DEFAULT 0"),
             ("tier", "INTEGER NOT NULL DEFAULT 2"),
             ("metadata", "TEXT NOT NULL DEFAULT '{}'"),
+            # 自作判定门禁：被推翻事实的软废弃标记
+            ("status", "TEXT NOT NULL DEFAULT 'active'"),
+            ("superseded_by", "TEXT NOT NULL DEFAULT ''"),
+            ("superseded_at", "REAL NOT NULL DEFAULT 0.0"),
         ]
         try:
             cur = conn.execute("PRAGMA table_info(l2_atoms)")
@@ -186,6 +190,7 @@ class MemoryRetriever:
                     SELECT *
                     FROM l2_atoms
                     WHERE (pinned = 1 OR tier >= 3)
+                      AND COALESCE(status, 'active') != 'superseded'
                     ORDER BY
                         CASE WHEN scope_key = ? OR session_id = ? THEN 0 ELSE 1 END ASC,
                         importance DESC,
@@ -200,6 +205,7 @@ class MemoryRetriever:
                     SELECT *
                     FROM l2_atoms
                     WHERE (pinned = 1 OR tier >= 3)
+                      AND COALESCE(status, 'active') != 'superseded'
                     ORDER BY importance DESC, updated_at DESC
                     LIMIT ?
                     """,
@@ -237,7 +243,8 @@ class MemoryRetriever:
                         """
                         SELECT *
                         FROM l2_atoms
-                        WHERE scope_key = ? OR session_id = ?
+                        WHERE (scope_key = ? OR session_id = ?)
+                          AND COALESCE(status, 'active') != 'superseded'
                         ORDER BY updated_at DESC
                         LIMIT ?
                         """,
@@ -248,6 +255,7 @@ class MemoryRetriever:
                         """
                         SELECT *
                         FROM l2_atoms
+                        WHERE COALESCE(status, 'active') != 'superseded'
                         ORDER BY
                             CASE WHEN scope_key = ? OR session_id = ? THEN 0 ELSE 1 END ASC,
                             updated_at DESC
@@ -260,6 +268,7 @@ class MemoryRetriever:
                     """
                     SELECT *
                     FROM l2_atoms
+                    WHERE COALESCE(status, 'active') != 'superseded'
                     ORDER BY updated_at DESC
                     LIMIT ?
                     """,

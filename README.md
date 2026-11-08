@@ -50,6 +50,17 @@ Query ──► ① L3 强力置顶捞取（pinned=1，按 importance 排序，�
 
 ---
 
+### 1.5 自作判定门禁（Evaluator Gate）
+
+在 L2 原子事实入库前插入一层“廉价模型预判定”，用极小成本挡住噪声、守住一致性：
+
+- **信息价值打分**：`value_score` 过滤寒暄、语气应答与无信息量废话（默认阈值 `0.35`）；
+- **事实冲突与推翻检测**：识别“我不喜欢喝绿茶”这类与旧事实矛盾的新事实，把被推翻的旧原子标记为
+  `status='superseded'` 软废弃（保留可追溯性，检索侧不再召回）；
+- **异常平滑降级**：判官模型超时 / 报错 / 返回非法 JSON 时自动回退本地规则判定，
+  主记忆流程**永不阻断**（`fail-open` 默认开启，宁多记不丢记忆）；
+- **判官模型**：默认 `jev`，`api_base` / `api_key` 留空时自动复用 `summarizer.*` 凭证，无需重复填写。
+
 ## 2. 架构与数据流
 
 ```text
@@ -74,11 +85,12 @@ Query ──► ① L3 强力置顶捞取（pinned=1，按 importance 排序，�
 | :-- | :-- |
 | `main.py` | Star 主类：配置规范化、五组件总装、生命周期托管、双向钩子、`/memory` 指令层 |
 | `storage.py` | SQLite 存储引擎：DDL、连接管理（WAL）、分层统计、`toggle_atom_pin()` 置顶切换 |
-| `summarizer.py` | 多轮缓冲池 + 异步 Worker：事实抽取（LLM / 规则回退）、向量去重融合、L3 晋升、DLQ 降级 |
+| `summarizer.py` | 多轮缓冲池 + 异步 Worker：事实抽取（LLM / 规则回退）、**自作判定门禁接入**、向量去重融合、L3 晋升、DLQ 降级 |
+| `evaluator.py` | **自作判定门禁**：廉价判官模型（默认 `jev`）信息价值打分、事实冲突/推翻检测、超时与异常平滑降级 |
 | `retriever.py` | 两阶段混合检索：L3 置顶捞取、粗排召回、精排重排、Markdown 上下文组装 |
 | `models_client.py` | BGE-M3 向量客户端与 BGE-Reranker 客户端，含维度对齐校验与 RRF 降级 |
 | `migrator.py` | 旧版 `livingmemory` 资产无损迁移（dry-run / 备份快照 / 孤儿边跳过） |
-| `tests/` | Stage 1~4 全量测试套件（单元 + 端到端闭环） |
+| `tests/` | Stage 1~5 全量测试套件（单元 + 端到端闭环 + 判定门禁） |
 
 ---
 
@@ -222,6 +234,21 @@ Query ──► ① L3 强力置顶捞取（pinned=1，按 importance 排序，�
 | `timeout_seconds` | `45` | 总结请求超时 |
 | `max_concurrency` | `2` | 后台总结最大并发 |
 
+### 自作判定门禁（`evaluator.*`）
+
+| 配置项 | 默认 | 说明 |
+| :-- | :-- | :-- |
+| `enable` | `true` | 是否启用入库前预判定（关闭则原样入库） |
+| `model_name` | `jev` | **判官模型名称**；留空回退 `summarizer.model` |
+| `api_base` / `api_key` | `''` | 判官端点；留空自动复用 `summarizer.api_base` / `api_key` |
+| `timeout_seconds` | `8.0` | 判官请求超时，超时即降级为规则判定 |
+| `min_value_score` | `0.35` | 信息价值过滤阈值（低于即丢弃） |
+| `fallback_min_value_score` | `0.175` | 降级路径的放宽阈值，避免误伤有效记忆 |
+| `conflict_check` | `true` | 启用事实冲突与推翻检测 |
+| `conflict_similarity` | `0.5` | 冲突判定的字符二元组相似度下限 |
+| `max_candidates` | `8` | 单次判官比对的历史事实上限 |
+| `fail_open` | `true` | 判官失败时是否保留事实 |
+
 ### 模型（`models.*`）与检索（`retrieval.*`）
 
 | 配置项 | 默认 | 说明 |
@@ -255,6 +282,7 @@ python3 tests/test_stage1_buffer.py      # 多轮缓冲打包 / 强制冲洗 / W
 python3 tests/test_stage2_hooks.py       # 双向钩子装配 / 注入 / 记录 / 降级 / 格式化
 python3 tests/test_stage3_commands.py    # 三态注入路由 / 四指令 / 指令组装配
 python3 tests/test_stage4_e2e.py         # 全链路端到端闭环 + 冷重启持久化
+python3 tests/test_stage5_evaluator_gate.py  # 判定门禁：价值打分 / 冲突废弃 / 超时降级
 ```
 
 ### 覆盖矩阵
@@ -265,6 +293,7 @@ python3 tests/test_stage4_e2e.py         # 全链路端到端闭环 + 冷重启�
 | **Stage 2** | 钩子装饰器注册、记忆块前置注入且人设保留、注入幂等、分片/工具轮过滤、重复回调去重、检索异常/超时/缺失全降级、`format_memory_block` 优先/兜底/截断 |
 | **Stage 3** | `system_head`/`system_tail`/`user_head` 三态路由与别名归一化、`cmd_status`/`cmd_recall`/`cmd_pin`/`cmd_migrate` 输出与边界零异常、指令组装配 |
 | **Stage 4** | ① Worker 启动 → ② 5 轮真实钩子触发 batch → ③ L1 落库 + L2 沉淀 + L3 晋升（DLQ=0）→ ④ 两阶段检索注入 L3+L2 → ⑤ 三指令真实读写联动（`pin` 可逆切换并用 `status` 交叉验证）→ ⑥ `terminate()` 尾部冲洗/Worker 回收/连接关闭/数据无损；外加**冷重启复用同一库仍可召回** |
+| **Stage 5** | 判官默认模型 `jev` 与凭证回退、寒暄/纯提问过滤、否定极性翻转与推翻标记识别、判官成功路径（阈值过滤 + 非法 `conflict_id` 过滤）、非法 JSON/连接异常/超时三种降级、`enable=false` 放行、端到端“判官不可用仍入库”、端到端“旧事实软废弃且检索不召回”、融合场景不自我废弃 |
 
 ### Stage 4 实测闭环指标
 

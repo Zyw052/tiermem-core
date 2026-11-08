@@ -37,6 +37,11 @@ except ImportError:  # pragma: no cover
     from models_client import EmbeddingClient, RerankClient, cosine_similarity  # type: ignore
 
 try:
+    from .evaluator import EvaluatorGate, GateReport
+except ImportError:  # pragma: no cover
+    from evaluator import EvaluatorGate, GateReport  # type: ignore
+
+try:
     from .storage import StorageManager  # type: ignore
 except ImportError:
     try:
@@ -54,6 +59,11 @@ L3_PIN_KEYWORDS: Tuple[str, ...] = (
     "密码",
     "习惯",
 )
+
+
+def _normalize_fact_key(text: Any) -> str:
+    """归一化事实文本作为映射键（去空白与中英文标点，统一小写）。"""
+    return re.sub(r"[\s，。！？、；：,.!?;:~～\-—_\"'“”‘’()（）\[\]【】]+", "", str(text or "")).lower()
 
 
 def _pack_embedding(vec: Sequence[float]) -> Optional[bytes]:
@@ -102,6 +112,16 @@ class MemorySummarizer:
         self.embedding_client = embedding_client
         self.rerank_client = rerank_client
         self.config: Dict[str, Any] = config or {}
+
+        # ---- 自作判定门禁（廉价模型：默认 jev）----
+        # 门禁自身的所有异常都在 EvaluatorGate 内部消化，这里无需再包 try。
+        try:
+            self.evaluator = EvaluatorGate(self.config)
+        except Exception as exc:  # pragma: no cover - 极端配置兜底
+            logger.warning(
+                "[MemorySummarizer] EvaluatorGate 初始化失败，判定门禁将被禁用: %s", exc
+            )
+            self.evaluator = EvaluatorGate({"evaluator": {"enable": False}})
 
         # ---- 后台消费队列 ----
         try:
@@ -490,6 +510,10 @@ class MemorySummarizer:
                 ("pinned", "INTEGER NOT NULL DEFAULT 0"),
                 ("tier", "INTEGER NOT NULL DEFAULT 2"),
                 ("metadata", "TEXT NOT NULL DEFAULT '{}'"),
+                # 自作判定门禁：冲突废弃标记
+                ("status", "TEXT NOT NULL DEFAULT 'active'"),
+                ("superseded_by", "TEXT NOT NULL DEFAULT ''"),
+                ("superseded_at", "REAL NOT NULL DEFAULT 0.0"),
             ],
         }
         for table, cols in extended_cols.items():
@@ -848,6 +872,154 @@ class MemorySummarizer:
             )
         return atom_id, False
 
+    # ------------------------------------------------------------------
+    # 自作判定门禁：冲突候选拉取与旧事实废弃
+    # ------------------------------------------------------------------
+    async def _run_evaluator_gate(
+        self,
+        session_id: str,
+        facts: List[Dict[str, Any]],
+        now: float,
+    ) -> Optional[GateReport]:
+        """
+        执行自作判定门禁。
+
+        双重容错：
+        1. EvaluatorGate 内部已处理模型超时/异常，降级为规则判定；
+        2. 这里再做一层 try-except：门禁自身崩溃时返回 None，
+           调用方将按“不过滤、原样入库”处理，保证记忆主链路永不被阻断。
+        """
+        try:
+            candidates = self._fetch_conflict_candidates(session_id)
+            report = await self.evaluator.gate(session_id, facts, candidates)
+            if report.degraded:
+                logger.warning(
+                    "[MemorySummarizer] 判定门禁降级运行 session=%s reason=%s report=%s",
+                    session_id,
+                    report.error,
+                    report.summary(),
+                )
+            return report
+        except Exception as exc:
+            logger.error(
+                "[MemorySummarizer] 判定门禁异常，已 fail-open 放行 session=%s: %s",
+                session_id,
+                exc,
+                exc_info=True,
+            )
+            return None
+
+    def _fetch_conflict_candidates(
+        self, session_id: str, limit: int = 40
+    ) -> List[Dict[str, Any]]:
+        """
+        拉取当前作用域内仍有效（status != superseded）的历史原子，供判官做冲突比对。
+
+        异常安全：任何失败都返回空列表，冲突检测自动退化为“不检测”，
+        绝不影响正常入库流程。
+        """
+        candidates: List[Dict[str, Any]] = []
+        try:
+            conn = self.storage.connect()
+            self._ensure_storage_columns(conn)
+            cur = conn.execute(
+                """
+                SELECT atom_id, content, importance, pinned, status
+                FROM l2_atoms
+                WHERE scope_key = ? AND COALESCE(status, 'active') != 'superseded'
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (session_id, int(max(1, limit))),
+            )
+            for row in cur.fetchall():
+                content = str(row["content"] or "").strip()
+                if not content:
+                    continue
+                candidates.append(
+                    {
+                        "atom_id": str(row["atom_id"]),
+                        "content": content,
+                        "importance": float(row["importance"] or 0.5),
+                        "pinned": int(row["pinned"] or 0),
+                    }
+                )
+        except Exception as exc:
+            logger.debug("[MemorySummarizer] 冲突候选拉取失败（忽略）: %s", exc)
+            return []
+        return candidates
+
+    def _apply_conflict_resolution(
+        self,
+        conflicts: Sequence[Dict[str, Any]],
+        fact_atom_map: Dict[str, str],
+        now: float,
+    ) -> int:
+        """
+        将判官认定的冲突旧事实标记为 superseded（软废弃），并降低其重要度。
+
+        - 不物理删除，保留可追溯性；
+        - superseded_by 尽量指向本轮新事实的 atom_id；
+        - 异常安全：失败仅记日志，不阻断入库。
+        返回成功废弃条数。
+        """
+        if not conflicts:
+            return 0
+
+        applied = 0
+        # 本轮新建/融合出的原子集合：冲突废弃必须跳过它们，避免“自我废弃”
+        protected_ids = {str(v) for v in fact_atom_map.values() if v}
+        try:
+            conn = self.storage.connect()
+            self._ensure_storage_columns(conn)
+            with conn:
+                for item in conflicts:
+                    if not isinstance(item, dict):
+                        continue
+                    atom_id = str(item.get("atom_id") or "").strip()
+                    if not atom_id:
+                        continue
+                    if atom_id in protected_ids:
+                        # 该旧原子本轮已被融合更新（内容已更新为新事实），无需废弃
+                        logger.debug(
+                            "[MemorySummarizer] 冲突目标本轮已被融合更新，跳过废弃 atom=%s",
+                            atom_id,
+                        )
+                        continue
+                    replacement = fact_atom_map.get(
+                        _normalize_fact_key(item.get("fact", "")), ""
+                    )
+                    cur = conn.execute(
+                        """
+                        UPDATE l2_atoms
+                        SET status = 'superseded',
+                            superseded_by = ?,
+                            superseded_at = ?,
+                            pinned = 0,
+                            tier = 2,
+                            importance = MIN(COALESCE(importance, 0.5), 0.1),
+                            updated_at = ?
+                        WHERE atom_id = ?
+                          AND COALESCE(status, 'active') != 'superseded'
+                        """,
+                        (replacement, now, now, atom_id),
+                    )
+                    if cur.rowcount:
+                        applied += 1
+                        logger.info(
+                            "[MemorySummarizer] 冲突废弃旧事实 atom=%s reason=%s replacement=%s",
+                            atom_id,
+                            item.get("reason", ""),
+                            replacement or "-",
+                        )
+        except Exception as exc:
+            logger.error(
+                "[MemorySummarizer] 冲突废弃落库失败（已忽略，不影响入库）: %s",
+                exc,
+                exc_info=True,
+            )
+        return applied
+
     async def process_dialogue(
         self, session_id: str, user_text: str, assistant_text: str
     ) -> None:
@@ -884,7 +1056,21 @@ class MemorySummarizer:
             if not facts:
                 return
 
+            # 2.5 自作判定门禁：信息价值过滤 + 冲突检测（失败自动降级，不阻断）
+            gate_report = await self._run_evaluator_gate(clean_session, facts, now)
+            if gate_report is not None:
+                facts = gate_report.kept
+
+            if not facts:
+                logger.debug(
+                    "[MemorySummarizer] 判定门禁过滤后无有效事实 session=%s（dropped=%s）",
+                    clean_session,
+                    len(gate_report.dropped) if gate_report else 0,
+                )
+                return
+
             # 3. 逐条事实向量化、L2 余弦相似度去重融合与 L3 置顶判定
+            fact_atom_map: Dict[str, str] = {}
             for item in facts:
                 fact_text = str(item.get("fact", "")).strip()
                 if not fact_text:
@@ -902,12 +1088,26 @@ class MemorySummarizer:
                     source_doc_id=l1_doc_id,
                     now=now,
                 )
+                fact_atom_map[_normalize_fact_key(fact_text)] = atom_id
                 logger.debug(
-                    "[MemorySummarizer] Processed fact session=%s atom=%s merged=%s pinned=%s",
+                    "[MemorySummarizer] Processed fact session=%s atom=%s merged=%s pinned=%s value_score=%s",
                     clean_session,
                     atom_id,
                     merged,
                     item.get("pinned", 0),
+                    item.get("value_score"),
+                )
+
+            # 3.5 应用冲突判定：把被推翻的旧事实软废弃（superseded）
+            if gate_report is not None and gate_report.conflicts:
+                applied = self._apply_conflict_resolution(
+                    gate_report.conflicts, fact_atom_map, now
+                )
+                logger.info(
+                    "[MemorySummarizer] 判定门禁冲突处理 session=%s detected=%s applied=%s",
+                    clean_session,
+                    len(gate_report.conflicts),
+                    applied,
                 )
         except Exception as exc:
             logger.error(

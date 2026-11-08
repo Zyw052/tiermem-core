@@ -78,6 +78,78 @@
       }
     }
   },
+  "evaluator": {
+    "description": "自作判定门禁（廉价模型预判定）",
+    "type": "object",
+    "items": {
+      "enable": {
+        "description": "启用自作判定门禁",
+        "type": "bool",
+        "default": true,
+        "hint": "在 L2 原子事实入库前用廉价模型做一轮信息价值打分与冲突检测；关闭则原样入库"
+      },
+      "model_name": {
+        "description": "判官模型名称",
+        "type": "string",
+        "default": "jev",
+        "hint": "主人指定默认 jev；留空则回退为总结模型（summarizer.model）"
+      },
+      "api_base": {
+        "description": "判官模型 API 地址(OpenAI 兼容)",
+        "type": "string",
+        "default": "",
+        "hint": "留空则自动回退复用 summarizer.api_base"
+      },
+      "api_key": {
+        "description": "判官模型 API 密钥",
+        "type": "string",
+        "default": "",
+        "hint": "留空则自动回退复用 summarizer.api_key"
+      },
+      "timeout_seconds": {
+        "description": "判官请求超时(秒)",
+        "type": "float",
+        "default": 8.0,
+        "hint": "超时即平滑降级为本地规则判定，绝不阻断记忆主链路"
+      },
+      "min_value_score": {
+        "description": "信息价值过滤阈值",
+        "type": "float",
+        "default": 0.35,
+        "hint": "value_score 低于该值的事实被丢弃（寒暄/低价值废话）；建议 0.3~0.5"
+      },
+      "fallback_min_value_score": {
+        "description": "降级状态下的过滤阈值",
+        "type": "float",
+        "default": 0.175,
+        "hint": "判官模型失败时使用的更宽松阈值，保证不误伤有效记忆"
+      },
+      "conflict_check": {
+        "description": "启用事实冲突与推翻检测",
+        "type": "bool",
+        "default": true,
+        "hint": "识别与旧事实矛盾的新事实，并把旧原子标记为 superseded 软废弃"
+      },
+      "conflict_similarity": {
+        "description": "冲突判定相似度下限",
+        "type": "float",
+        "default": 0.5,
+        "hint": "新旧事实字符二元组 Jaccard 相似度达到该值才进入冲突判定"
+      },
+      "max_candidates": {
+        "description": "单次判官比对的候选事实上限",
+        "type": "int",
+        "default": 8,
+        "hint": "过大会增加判官 token 开销，建议 5~12"
+      },
+      "fail_open": {
+        "description": "判官失败时保留事实(fail-open)",
+        "type": "bool",
+        "default": true,
+        "hint": "开启则降级时仍尽量入库；关闭则严格按规则阈值过滤"
+      }
+    }
+  },
   "models": {
     "description": "向量化与重排模型配置",
     "type": "object",

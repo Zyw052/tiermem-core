@@ -73,11 +73,13 @@ try:
     from .storage import MemoryStorage
     from .models_client import EmbeddingClient, RerankClient
     from .summarizer import MemorySummarizer
+    from .evaluator import DEFAULT_EVALUATOR_MODEL
     from .retriever import MemoryRetriever
 except ImportError:  # pragma: no cover
     from storage import MemoryStorage  # type: ignore
     from models_client import EmbeddingClient, RerankClient  # type: ignore
     from summarizer import MemorySummarizer  # type: ignore
+    from evaluator import DEFAULT_EVALUATOR_MODEL  # type: ignore
     from retriever import MemoryRetriever  # type: ignore
 
 
@@ -643,9 +645,46 @@ class AgentMemoryPlugin(Star):
             default="",
         )
 
+        # 自作判定门禁（廉价模型，默认 jev）：凭证留空则回退主总结模型
+        evaluator_cfg = dict(self._section("evaluator"))
+        evaluator_runtime: Dict[str, Any] = {
+            "enable": bool(evaluator_cfg.get("enable", True)),
+            "api_base": _first_non_empty(
+                evaluator_cfg.get("api_base"), llm_api_base, default=""
+            ),
+            "api_key": _first_non_empty(
+                evaluator_cfg.get("api_key"), llm_api_key, default=""
+            ),
+            # 主人指定：默认使用 jev；留空则回退主总结模型
+            "model_name": _first_non_empty(
+                evaluator_cfg.get("model_name"),
+                evaluator_cfg.get("model"),
+                default=DEFAULT_EVALUATOR_MODEL,
+            ),
+            "timeout_seconds": _safe_float(
+                evaluator_cfg.get("timeout_seconds"), 8.0
+            ),
+            "min_value_score": _safe_float(
+                evaluator_cfg.get("min_value_score"), 0.35
+            ),
+            "fallback_min_value_score": _safe_float(
+                evaluator_cfg.get("fallback_min_value_score"), 0.175
+            ),
+            "conflict_check": bool(evaluator_cfg.get("conflict_check", True)),
+            "fail_open": bool(evaluator_cfg.get("fail_open", True)),
+            "max_candidates": _safe_int(
+                evaluator_cfg.get("max_candidates"), 8, minimum=1
+            ),
+            "conflict_similarity": _safe_float(
+                evaluator_cfg.get("conflict_similarity"), 0.5
+            ),
+        }
+
         runtime_cfg: Dict[str, Any] = {
             # 轮次窗口：达到 N 轮才打包总结
             "summary_turn_interval": self.turn_interval,
+            # 自作判定门禁配置（summarizer 内部构造 EvaluatorGate 时读取）
+            "evaluator": evaluator_runtime,
             "summarizer_queue_maxsize": _safe_int(
                 self.config.get("summarizer_queue_maxsize"), 1000, minimum=1
             ),
