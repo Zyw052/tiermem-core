@@ -103,11 +103,51 @@ class MemorySummarizer:
         self.rerank_client = rerank_client
         self.config: Dict[str, Any] = config or {}
 
-        max_queue_size = int(self.config.get("summarizer_queue_maxsize", 1000))
+        # ---- 后台消费队列 ----
+        try:
+            max_queue_size = int(self.config.get("summarizer_queue_maxsize", 1000))
+        except (TypeError, ValueError):
+            max_queue_size = 1000
+        max_queue_size = max(1, max_queue_size)
         self._queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=max_queue_size)
         self._worker_task: Optional[asyncio.Task] = None
         self._running: bool = False
         self._schema_checked: bool = False
+
+        # ---- 多轮缓冲池 (turn window batching) ----
+        # 结构: {session_id: [ {"user_text": ..., "assistant_text": ..., "enqueued_at": ...}, ... ]}
+        # 说明: 所有缓冲操作均在同一事件循环内且关键区内无 await，
+        #       因此天然原子，无需额外加锁。
+        self._turn_buffers: Dict[str, List[Dict[str, Any]]] = {}
+        self.turn_interval: int = self._parse_turn_interval(self.config)
+
+        # ---- 运行期统计（仅用于可观测性，不参与业务逻辑）----
+        self._stat_turns_buffered: int = 0   # 累计进入缓冲池的轮次
+        self._stat_batches_enqueued: int = 0  # 累计打包推入消费队列的批次数
+        self._stat_turns_flushed: int = 0    # 累计通过 flush_* 强制触发的轮次
+
+    @staticmethod
+    def _parse_turn_interval(config: Dict[str, Any]) -> int:
+        """
+        解析 summary_turn_interval（默认 5 轮）：
+        优先读取顶层 key，其次读取 config["summarizer"]["summary_turn_interval"]，
+        任何非法值（非数字/<=0）均安全回退为 5。
+        """
+        candidates: List[Any] = [config.get("summary_turn_interval")]
+        summarizer_cfg = config.get("summarizer")
+        if isinstance(summarizer_cfg, dict):
+            candidates.append(summarizer_cfg.get("summary_turn_interval"))
+
+        for raw in candidates:
+            if raw is None or raw == "":
+                continue
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return 5
 
     def start(self) -> None:
         """启动后台异步消费 Task"""
@@ -119,8 +159,42 @@ class MemorySummarizer:
         )
         logger.info("[MemorySummarizer] Async worker started.")
 
-    async def stop(self) -> None:
-        """优雅停止后台异步消费 Task"""
+    async def stop(self, flush: bool = True, drain_timeout: float = 5.0) -> None:
+        """
+        优雅停止后台异步消费 Task。
+
+        :param flush: 停止前是否先强制冲洗所有会话的剩余轮次（默认 True，避免丢记忆）
+        :param drain_timeout: 冲洗后等待队列消费完成的最大秒数
+        """
+        # 1. 先冲洗缓冲池，保证最后不足 N 轮的对话也能进入消费队列
+        if flush:
+            try:
+                flushed = await self.flush_all()
+                total = sum(flushed.values())
+                if total:
+                    logger.info(
+                        "[MemorySummarizer] stop(): flushed %d pending turn(s) from %d session(s).",
+                        total,
+                        len(flushed),
+                    )
+            except Exception as exc:
+                logger.warning("[MemorySummarizer] flush_all during stop failed: %s", exc)
+
+        # 2. 尽力消费完队列中遗留任务（超时不阻塞卸载流程）
+        if self._worker_task is not None and self._running:
+            try:
+                if not self._queue.empty():
+                    await asyncio.wait_for(self._queue.join(), timeout=float(drain_timeout))
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[MemorySummarizer] Queue drain timeout(%.1fs), %d task(s) left.",
+                    float(drain_timeout),
+                    self._queue.qsize(),
+                )
+            except Exception as exc:
+                logger.warning("[MemorySummarizer] Queue drain error: %s", exc)
+
+        # 3. 取消 Worker
         self._running = False
         if self._worker_task is not None:
             self._worker_task.cancel()
@@ -138,33 +212,165 @@ class MemorySummarizer:
         self, session_id: str, user_text: str, assistant_text: str
     ) -> bool:
         """
-        极速将对话事件入队（零阻塞）。
-        若队列已满则降级写入死信队列或记录告警，绝不阻塞主对话链路。
+        将单轮对话累积进会话缓冲池（零阻塞、零 IO）。
+
+        行为：
+        - 每轮先按 session_id 累积到内存缓冲池；
+        - 仅当该会话累积轮次达到 summary_turn_interval 时，才把这 N 轮
+          打包成一个 batch 事件推入后台总结消费队列，减少 LLM 调用次数；
+        - 不足 N 轮的尾部对话由 flush_session() / flush_all() 强制打包，
+          避免会话结束或插件关闭时丢失记忆。
+
+        :param assistant_text: 机器人回复（即 bot_text）
+        :return: True 表示该轮已被接受（进入缓冲或成功打包入队）
         """
-        event = {
-            "session_id": str(session_id or "").strip(),
-            "user_text": str(user_text or "").strip(),
-            "assistant_text": str(assistant_text or "").strip(),
-            "enqueued_at": time.time(),
-        }
-        if not event["session_id"] or (
-            not event["user_text"] and not event["assistant_text"]
-        ):
+        sid = str(session_id or "").strip()
+        user = str(user_text or "").strip()
+        bot = str(assistant_text or "").strip()
+        if not sid or (not user and not bot):
             return False
 
+        turn = {
+            "user_text": user,
+            "assistant_text": bot,
+            "enqueued_at": time.time(),
+        }
+
+        # 关键区内无 await，事件循环内天然原子
+        buffer = self._turn_buffers.setdefault(sid, [])
+        buffer.append(turn)
+        self._stat_turns_buffered += 1
+
+        # 未达阈值：安静地留在缓冲池里等待下一轮
+        if len(buffer) < self.turn_interval:
+            logger.debug(
+                "[MemorySummarizer] Buffered turn %d/%d for session=%s",
+                len(buffer),
+                self.turn_interval,
+                sid,
+            )
+            return True
+
+        # 达到阈值：整窗打包送入后台消费队列
+        turns = buffer[: self.turn_interval]
+        del buffer[: self.turn_interval]
+        if not buffer:
+            self._turn_buffers.pop(sid, None)
+
+        return self._pack_and_enqueue(sid, turns, reason="threshold")
+
+    def _pack_and_enqueue(
+        self, session_id: str, turns: List[Dict[str, Any]], reason: str = "threshold"
+    ) -> bool:
+        """
+        将若干轮对话打包为一个 batch 事件推入后台消费队列。
+
+        :param reason: "threshold"（达到轮次阈值）或 "flush"（强制冲洗）
+        :return: True 表示成功入队；队列满等异常时降级写 DLQ 并返回 False
+        """
+        if not turns:
+            return True
+
+        batch_event: Dict[str, Any] = {
+            "kind": "batch",
+            "session_id": session_id,
+            "turns": turns,
+            "turn_count": len(turns),
+            "reason": reason,
+            "enqueued_at": time.time(),
+        }
+
         try:
-            self._queue.put_nowait(event)
+            self._queue.put_nowait(batch_event)
+            self._stat_batches_enqueued += 1
+            if reason == "flush":
+                self._stat_turns_flushed += len(turns)
+            logger.debug(
+                "[MemorySummarizer] Batch enqueued session=%s turns=%d reason=%s",
+                session_id,
+                len(turns),
+                reason,
+            )
             return True
         except asyncio.QueueFull:
             logger.warning(
-                "[MemorySummarizer] Dialogue queue full, degrading to DLQ for session=%s",
-                event["session_id"],
+                "[MemorySummarizer] Summary queue full, degrading batch to DLQ for session=%s turns=%d",
+                session_id,
+                len(turns),
             )
-            self._record_dlq(event, "QueueFull: dialogue queue reached maxsize")
+            self._record_dlq(batch_event, "QueueFull: summary queue reached maxsize")
             return False
         except Exception as exc:
-            logger.error("[MemorySummarizer] Enqueue failed: %s", exc)
+            logger.error("[MemorySummarizer] Failed to enqueue batch: %s", exc)
+            self._record_dlq(batch_event, f"EnqueueFailed: {exc}")
             return False
+
+    async def flush_session(self, session_id: str) -> int:
+        """
+        立即冲洗指定会话缓冲池中的所有剩余轮次（不足 summary_turn_interval 的尾部）。
+
+        :return: 本次实际打包入队的轮次数（0 表示该会话无待总结内容）
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0
+
+        turns = self._turn_buffers.pop(sid, None)
+        if not turns:
+            return 0
+
+        ok = self._pack_and_enqueue(sid, turns, reason="flush")
+        if not ok:
+            # 入队失败（队列满）时，把轮次放回缓冲池，避免静默丢数据
+            self._turn_buffers.setdefault(sid, []).extend(turns)
+            return 0
+
+        logger.info(
+            "[MemorySummarizer] flush_session(%s): %d turn(s) flushed.", sid, len(turns)
+        )
+        return len(turns)
+
+    async def flush_all(self) -> Dict[str, int]:
+        """
+        立即冲洗所有会话的剩余轮次（会话结束 / 插件关闭 / 服务重启前调用）。
+
+        :return: {session_id: 本次打包入队的轮次数}
+        """
+        results: Dict[str, int] = {}
+        for sid in list(self._turn_buffers.keys()):
+            count = await self.flush_session(sid)
+            if count:
+                results[sid] = count
+        if results:
+            logger.info(
+                "[MemorySummarizer] flush_all(): %d session(s), %d turn(s) flushed.",
+                len(results),
+                sum(results.values()),
+            )
+        return results
+
+    def pending_turns(self, session_id: Optional[str] = None) -> int:
+        """查询缓冲池中尚未总结的轮次数（session_id 为空时统计全部会话）。"""
+        if session_id is not None:
+            return len(self._turn_buffers.get(str(session_id).strip(), []))
+        return sum(len(turns) for turns in self._turn_buffers.values())
+
+    def get_buffer_stats(self) -> Dict[str, Any]:
+        """返回缓冲池与打包统计快照，供状态指令 / 健康检查使用。"""
+        return {
+            "turn_interval": self.turn_interval,
+            "active_sessions": len(self._turn_buffers),
+            "pending_turns": self.pending_turns(),
+            "pending_by_session": {
+                sid: len(turns) for sid, turns in self._turn_buffers.items()
+            },
+            "queue_size": self._queue.qsize(),
+            "queue_maxsize": self._queue.maxsize,
+            "stat_turns_buffered": self._stat_turns_buffered,
+            "stat_batches_enqueued": self._stat_batches_enqueued,
+            "stat_turns_flushed": self._stat_turns_flushed,
+            "running": self._running,
+        }
 
     async def _worker_loop(self) -> None:
         """后台循环取出队列中的对话事件并执行总结处理，包含异常捕获与死信降级"""
@@ -179,11 +385,7 @@ class MemorySummarizer:
                 continue
 
             try:
-                await self.process_dialogue(
-                    session_id=event.get("session_id", ""),
-                    user_text=event.get("user_text", ""),
-                    assistant_text=event.get("assistant_text", ""),
-                )
+                await self._handle_event(event)
             except asyncio.CancelledError:
                 self._record_dlq(event, "WorkerCancelledDuringProcess")
                 raise
@@ -200,6 +402,73 @@ class MemorySummarizer:
                     self._queue.task_done()
                 except ValueError:
                     pass
+
+    async def _handle_event(self, event: Dict[str, Any]) -> None:
+        """
+        分发单个队列事件：
+        - kind == "batch"：逐轮调用 process_dialogue 处理同一会话的 N 轮对话；
+          单轮失败不阻断整批，失败轮次汇总后统一降级写入 DLQ；
+        - 其他格式（兼容历史的单轮事件）：直接按单轮处理。
+        """
+        if not isinstance(event, dict):
+            logger.warning("[MemorySummarizer] Skip invalid event type: %s", type(event))
+            return
+
+        if event.get("kind") != "batch":
+            await self.process_dialogue(
+                session_id=event.get("session_id", ""),
+                user_text=event.get("user_text", ""),
+                assistant_text=event.get("assistant_text", ""),
+            )
+            return
+
+        session_id = str(event.get("session_id", "") or "").strip()
+        turns = event.get("turns")
+        if not session_id or not isinstance(turns, list) or not turns:
+            logger.warning("[MemorySummarizer] Skip malformed batch event: %r", event)
+            return
+
+        succeeded = 0
+        failed_turns: List[Dict[str, Any]] = []
+        for turn in turns:
+            if not isinstance(turn, dict):
+                continue
+            try:
+                await self.process_dialogue(
+                    session_id=session_id,
+                    user_text=turn.get("user_text", ""),
+                    assistant_text=turn.get("assistant_text", ""),
+                )
+                succeeded += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "[MemorySummarizer] Batch turn failed session=%s: %s",
+                    session_id,
+                    exc,
+                    exc_info=True,
+                )
+                failed_turns.append(turn)
+
+        if failed_turns:
+            self._record_dlq(
+                {
+                    "session_id": session_id,
+                    "turns": failed_turns,
+                    "kind": "batch_partial_failure",
+                    "enqueued_at": event.get("enqueued_at", time.time()),
+                },
+                f"BatchPartialFailure: {len(failed_turns)}/{len(turns)} turn(s) failed",
+            )
+
+        logger.debug(
+            "[MemorySummarizer] Batch done session=%s ok=%d/%d reason=%s",
+            session_id,
+            succeeded,
+            len(turns),
+            event.get("reason", "threshold"),
+        )
 
     def _ensure_storage_columns(self, conn: sqlite3.Connection) -> None:
         """幂等检查并补齐 l1_docs / l2_atoms 的扩展列（如 pinned, tier 等）"""

@@ -5,6 +5,24 @@
     "default": true,
     "hint": "全局开关，控制是否启用 L1/L2/L3 记忆自动召回与归档"
   },
+  "db_path": {
+    "description": "记忆数据库文件路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空则使用 <AstrBot数据目录>/plugin_data/astrbot_plugin_agent_memory/agent_memory.db；也可填写完整 .db 文件路径或目录"
+  },
+  "summary_turn_interval": {
+    "description": "多轮缓冲总结阈值（轮）",
+    "type": "int",
+    "default": 5,
+    "hint": "同一会话累积 N 轮对话后才打包触发一次后台总结，减少 LLM 调用；会话结束或插件关闭时会强制冲洗剩余轮次"
+  },
+  "summarizer_queue_maxsize": {
+    "description": "后台总结队列最大容量",
+    "type": "int",
+    "default": 1000,
+    "hint": "队列满时降级写入 task_dlq 死信表，绝不阻塞主对话链路"
+  },
   "summarizer": {
     "description": "独立总结与提炼模型配置",
     "type": "object",
@@ -30,6 +48,95 @@
         "description": "总结请求超时时间(秒)",
         "type": "int",
         "default": 45
+      },
+      "summary_turn_interval": {
+        "description": "多轮缓冲总结阈值(轮)",
+        "type": "int",
+        "default": 5,
+        "hint": "与顶层配置等效，顶层优先；建议 3~8 轮"
+      },
+      "api_base": {
+        "description": "总结 LLM API 地址(OpenAI 兼容)",
+        "type": "string",
+        "default": ""
+      },
+      "api_key": {
+        "description": "总结 LLM API 密钥",
+        "type": "string",
+        "default": ""
+      },
+      "model": {
+        "description": "总结 LLM 模型名称",
+        "type": "string",
+        "default": ""
+      }
+    }
+  },
+  "models": {
+    "description": "向量化与重排模型配置",
+    "type": "object",
+    "items": {
+      "embedding": {
+        "description": "Embedding 模型",
+        "type": "object",
+        "items": {
+          "api_base": {
+            "description": "API 地址",
+            "type": "string",
+            "default": "https://api.siliconflow.cn/v1"
+          },
+          "api_key": {
+            "description": "API 密钥",
+            "type": "string",
+            "default": ""
+          },
+          "model": {
+            "description": "模型名称",
+            "type": "string",
+            "default": "BAAI/bge-m3"
+          },
+          "dim": {
+            "description": "向量维度",
+            "type": "int",
+            "default": 1024
+          },
+          "timeout": {
+            "description": "请求超时(秒)",
+            "type": "float",
+            "default": 30.0
+          }
+        }
+      },
+      "rerank": {
+        "description": "重排模型",
+        "type": "object",
+        "items": {
+          "api_base": {
+            "description": "API 地址",
+            "type": "string",
+            "default": "https://api.siliconflow.cn/v1"
+          },
+          "api_key": {
+            "description": "API 密钥",
+            "type": "string",
+            "default": ""
+          },
+          "model": {
+            "description": "模型名称",
+            "type": "string",
+            "default": "BAAI/bge-reranker-v2-m3"
+          },
+          "timeout": {
+            "description": "请求超时(秒)",
+            "type": "float",
+            "default": 20.0
+          },
+          "rrf_k": {
+            "description": "RRF 融合常数 k",
+            "type": "int",
+            "default": 60
+          }
+        }
       }
     }
   },
