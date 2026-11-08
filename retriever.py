@@ -71,6 +71,33 @@ def _unpack_embedding(blob: Any) -> List[float]:
     return []
 
 
+# 方案 B-2：矩阵缓存命中时，候选池无需再拉取 embedding_blob（省掉逐行 struct.unpack）。
+# 这里显式列出候选池所需列；缺失的扩展列会被自动过滤，保证旧库兼容。
+_POOL_COLUMNS: Tuple[str, ...] = (
+    "atom_id",
+    "scope_key",
+    "session_id",
+    "content",
+    "topics_json",
+    "key_facts_json",
+    "sentiment",
+    "importance",
+    "access_count",
+    "source_type",
+    "source_ref",
+    "last_accessed_at",
+    "created_at",
+    "updated_at",
+    "atom_type",
+    "pinned",
+    "tier",
+    "reinforcement_count",
+    "status",
+    "superseded_by",
+    "superseded_at",
+)
+
+
 def _compute_overlap_score(query: str, doc_text: str) -> float:
     """计算 query 与文档的字词重合度 (Overlap Ratio)，作为 BM25 在短文本上的补充特征。"""
     q_tokens = _tokenize_for_similarity(query)
@@ -101,6 +128,20 @@ class MemoryRetriever:
         self.rerank_client = rerank_client
         self.config: Dict[str, Any] = config if isinstance(config, dict) else {}
         self._schema_checked: bool = False
+
+        # ---- 方案 B：工业级引擎（FTS5 倒排索引 + 内存向量矩阵缓存）----
+        # 两者均在首次检索时懒初始化，任一路径不可用都会静默回退原有 Python 实现，
+        # 保证对旧库、旧配置、无 FTS5 的 SQLite 构建零破坏。
+        self._engine_b_ready: bool = False
+        self.fts_enabled: bool = False
+        self._matrix_cache: Any = getattr(storage, "embedding_cache", None)
+        self._matrix_sync_interval: float = 5.0
+        try:
+            self._matrix_sync_interval = max(
+                0.0, float(self.config.get("matrix_cache_sync_interval", 5.0) or 0.0)
+            )
+        except (TypeError, ValueError):
+            self._matrix_sync_interval = 5.0
 
         # ---- R-05：访问计数改为内存累加 + 异步定期刷盘 ----
         # 检索是高频只读链路，任何同步 UPDATE 都会抢 SQLite 写锁并拖慢首字延迟。
@@ -157,6 +198,79 @@ class MemoryRetriever:
             self._schema_checked = True
         except Exception as exc:
             logger.warning("[MemoryRetriever] 检查扩展列异常: %s", exc)
+
+    # ------------------------------------------------------------------
+    # 方案 B：工业级引擎懒初始化（FTS5 + 向量矩阵缓存）
+    # ------------------------------------------------------------------
+    def _ensure_engine_b(self, conn: sqlite3.Connection) -> None:
+        """
+        首次检索时初始化引擎增强组件（幂等，任何异常都只会降级不会中断检索）：
+
+        1. FTS5：确保虚拟表/触发器/预分词列就绪（旧库自动 backfill）；
+        2. 向量矩阵缓存：一次性构建 ``atom_id -> index`` 映射与二维归一化矩阵。
+
+        注意调用顺序必须在 :meth:`_ensure_storage_columns` 之后——
+        软废弃触发器的创建依赖 status 扩展列已存在。
+        """
+        if self._engine_b_ready:
+            return
+        self._engine_b_ready = True
+
+        # 1. FTS5 倒排索引
+        try:
+            self.fts_enabled = bool(self.storage.ensure_fts_index(conn))
+        except Exception as exc:
+            logger.warning(
+                "[MemoryRetriever] FTS5 初始化失败，全文检索回退 Python BM25: %s", exc
+            )
+            self.fts_enabled = False
+
+        # 2. 向量矩阵缓存
+        try:
+            if self._matrix_cache is not None:
+                self._matrix_cache.ensure_built(conn)
+        except Exception as exc:
+            logger.warning(
+                "[MemoryRetriever] 向量矩阵缓存构建失败，回退逐条余弦计算: %s", exc
+            )
+            self._matrix_cache = None
+
+        logger.info(
+            "[MemoryRetriever] 引擎升级状态: fts5=%s, matrix_cache=%s",
+            "on" if self.fts_enabled else "off(fallback bm25)",
+            (self._matrix_cache.stats() if self._matrix_cache is not None else "off"),
+        )
+
+    def _sync_matrix_cache(self, conn: sqlite3.Connection) -> None:
+        """轻量一致性校验（节流），兜住绕过缓存的数据库变更。"""
+        if self._matrix_cache is None:
+            return
+        try:
+            self._matrix_cache.sync_if_stale(conn, max_age=self._matrix_sync_interval)
+        except Exception as exc:
+            logger.debug("[MemoryRetriever] 矩阵缓存同步失败（忽略）: %s", exc)
+
+    def _fts_keyword_scores(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        limit: int,
+    ) -> Optional[Dict[str, float]]:
+        """
+        调用 FTS5 倒排索引获取关键词得分映射。
+
+        :return: ``{atom_id: 归一化 bm25 分数}``；FTS5 不可用、无有效 token
+                 或查询异常时返回 ``None``，调用方回退 Python BM25。
+                 返回空字典表示「索引可用但无命中」，同样由调用方决定是否兜底。
+        """
+        if not self.fts_enabled:
+            return None
+        try:
+            hits = self.storage.fts_search(query, limit=max(1, int(limit)), conn=conn)
+        except Exception as exc:
+            logger.debug("[MemoryRetriever] FTS5 检索异常，回退 BM25: %s", exc)
+            return None
+        return {aid: score for aid, score in hits}
 
     def _row_to_atom_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         """将 SQLite 行记录转换为标准化的记忆原子字典。"""
@@ -290,14 +404,43 @@ class MemoryRetriever:
 
         return pinned_items
 
+    def _pool_column_sql(self, conn: sqlite3.Connection, with_embedding: bool) -> str:
+        """
+        构造候选池 SELECT 列清单。
+
+        ``with_embedding=False`` 时排除 ``embedding_blob`` 大字段，
+        配合向量矩阵缓存把全表反序列化开销降到零；若表结构探测失败则安全退回 ``*``。
+        """
+        if with_embedding:
+            return "*"
+        try:
+            existing = {
+                str(r[1]) for r in conn.execute("PRAGMA table_info(l2_atoms)").fetchall()
+            }
+            if not existing:
+                return "*"
+            keep = [col for col in _POOL_COLUMNS if col in existing]
+            return ", ".join(keep) if keep else "*"
+        except Exception as exc:  # pragma: no cover - 结构探测失败极罕见
+            logger.debug("[MemoryRetriever] 候选列构造失败，回退 SELECT *: %s", exc)
+            return "*"
+
     def _fetch_l2_pool(
         self,
         conn: sqlite3.Connection,
         session_id: Optional[str] = None,
         pool_limit: int = 500,
+        with_embedding: bool = True,
     ) -> List[Dict[str, Any]]:
-        """加载用于第一阶段粗排的 L2 原子记忆候选池。"""
+        """
+        加载用于第一阶段粗排的 L2 原子记忆候选池。
+
+        :param with_embedding: 是否一并拉取 embedding_blob。方案 B-2 命中矩阵缓存时
+            传 False，避免每行 struct.unpack 反序列化的 CPU 开销；候选进入精排前
+            会从内存矩阵按需回填向量。
+        """
         pool: List[Dict[str, Any]] = []
+        col_sql = self._pool_column_sql(conn, with_embedding)
         try:
             strict_session = self._strict_isolation()
             if session_id and str(session_id).strip():
@@ -305,8 +448,8 @@ class MemoryRetriever:
                 if strict_session:
                     # R-04：严格隔离（默认）——只允许本会话 + 显式 global 全局记忆
                     cur = conn.execute(
-                        """
-                        SELECT *
+                        f"""
+                        SELECT {col_sql}
                         FROM l2_atoms
                         WHERE (
                                 scope_key = ?
@@ -321,8 +464,8 @@ class MemoryRetriever:
                     )
                 else:
                     cur = conn.execute(
-                        """
-                        SELECT *
+                        f"""
+                        SELECT {col_sql}
                         FROM l2_atoms
                         WHERE COALESCE(status, 'active') != 'superseded'
                         ORDER BY
@@ -336,8 +479,8 @@ class MemoryRetriever:
                 if strict_session:
                     # 无会话上下文 + 严格隔离：仅召回显式 global 记忆
                     cur = conn.execute(
-                        """
-                        SELECT *
+                        f"""
+                        SELECT {col_sql}
                         FROM l2_atoms
                         WHERE COALESCE(status, 'active') != 'superseded'
                           AND COALESCE(scope_key, '') = 'global'
@@ -348,8 +491,8 @@ class MemoryRetriever:
                     )
                 else:
                     cur = conn.execute(
-                        """
-                        SELECT *
+                        f"""
+                        SELECT {col_sql}
                         FROM l2_atoms
                         WHERE COALESCE(status, 'active') != 'superseded'
                         ORDER BY updated_at DESC
@@ -366,7 +509,6 @@ class MemoryRetriever:
             logger.error("[MemoryRetriever] 加载 L2 候选池失败: %s", exc, exc_info=True)
 
         return pool
-
     async def _first_stage_recall(
         self,
         query: str,
@@ -374,6 +516,7 @@ class MemoryRetriever:
         pinned_ids: set[str],
         pinned_contents: set[str],
         candidate_k: int = 20,
+        fts_scores: Optional[Dict[str, float]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[float]]:
         """
         步骤 2：第一阶段粗排召回（First-Stage Recall）
@@ -407,29 +550,51 @@ class MemoryRetriever:
 
         has_valid_qvec = bool(query_vec) and any(abs(v) > 1e-12 for v in query_vec)
 
-        # 3. 计算向量余弦相似度
+        # 3. 计算向量余弦相似度（方案 B-2：优先一次矩阵乘法，回退逐条计算）
         vec_scores: List[float] = []
+        matrix_sim_map: Dict[str, float] = {}
+        use_matrix = False
+        if has_valid_qvec and self._matrix_cache is not None and self._matrix_cache.built:
+            try:
+                matrix_sim_map = self._matrix_cache.score_map(query_vec)
+                use_matrix = bool(matrix_sim_map)
+            except Exception as exc:
+                logger.debug("[MemoryRetriever] 矩阵打分失败，回退逐条计算: %s", exc)
+                use_matrix = False
+
         for atom in filtered_pool:
-            doc_vec = atom.get("_embedding") or []
-            if has_valid_qvec and doc_vec:
-                sim = cosine_similarity(query_vec, doc_vec)
-            else:
-                sim = 0.0
+            sim = 0.0
+            if has_valid_qvec:
+                if use_matrix:
+                    # 一次 np.dot(matrix, q) 已算出全部余弦，这里只做字典查表
+                    sim = matrix_sim_map.get(str(atom.get("atom_id", "")), 0.0)
+                else:
+                    doc_vec = atom.get("_embedding") or []
+                    if doc_vec:
+                        sim = cosine_similarity(query_vec, doc_vec)
             vec_scores.append(max(0.0, float(sim)))
 
-        # 4. 计算关键词得分（BM25 + 字词重合度）
-        docs_text = [
-            f"{atom.get('content', '')} {' '.join(atom.get('key_facts', []))}".strip()
-            for atom in filtered_pool
-        ]
-        bm25_raw = _compute_bm25_scores(query, docs_text)
-        max_bm25 = max(bm25_raw) if bm25_raw else 0.0
-
+        # 4. 计算关键词得分
+        # 方案 B-1：FTS5 命中时直接使用倒排索引 bm25 分数，跳过 Python 正则切词与双重循环；
+        # FTS 不可用 / 无命中时回退原有轻量 BM25 + 字词重合度实现。
         kw_scores: List[float] = []
-        for idx, doc_str in enumerate(docs_text):
-            norm_bm25 = (bm25_raw[idx] / max_bm25) if max_bm25 > 1e-9 else 0.0
-            overlap = _compute_overlap_score(query, doc_str)
-            kw_scores.append(0.7 * norm_bm25 + 0.3 * overlap)
+        if fts_scores:
+            for atom in filtered_pool:
+                kw_scores.append(
+                    float(fts_scores.get(str(atom.get("atom_id", "")), 0.0))
+                )
+        else:
+            docs_text = [
+                f"{atom.get('content', '')} {' '.join(atom.get('key_facts', []))}".strip()
+                for atom in filtered_pool
+            ]
+            bm25_raw = _compute_bm25_scores(query, docs_text)
+            max_bm25 = max(bm25_raw) if bm25_raw else 0.0
+
+            for idx, doc_str in enumerate(docs_text):
+                norm_bm25 = (bm25_raw[idx] / max_bm25) if max_bm25 > 1e-9 else 0.0
+                overlap = _compute_overlap_score(query, doc_str)
+                kw_scores.append(0.7 * norm_bm25 + 0.3 * overlap)
 
         # 5. 分别取向量召回 Top-N 与关键词召回 Top-N
         top_n_each = max(1, int(candidate_k))
@@ -467,6 +632,17 @@ class MemoryRetriever:
         candidates: List[Dict[str, Any]] = []
         for idx in sorted_candidate_indices:
             atom_copy = dict(filtered_pool[idx])
+            # 方案 B-2：候选池不再拉取 embedding_blob，进入精排前从内存矩阵按需回填。
+            # 缓存中存放的是单位向量，余弦相似度与原始向量等价，语义零偏差。
+            if not atom_copy.get("_embedding") and self._matrix_cache is not None:
+                try:
+                    cached_vec = self._matrix_cache.get_vector(
+                        str(atom_copy.get("atom_id", ""))
+                    )
+                    if cached_vec:
+                        atom_copy["_embedding"] = cached_vec
+                except Exception as exc:
+                    logger.debug("[MemoryRetriever] 回填候选向量失败（忽略）: %s", exc)
             atom_copy["coarse_vector_score"] = round(vec_scores[idx], 4)
             atom_copy["coarse_keyword_score"] = round(kw_scores[idx], 4)
             atom_copy["coarse_score"] = round(merged_indices[idx], 4)
@@ -746,6 +922,9 @@ class MemoryRetriever:
         try:
             conn = self.storage.connect()
             self._ensure_storage_columns(conn)
+            # 方案 B：懒初始化 FTS5 倒排索引与向量矩阵缓存（失败自动降级）
+            self._ensure_engine_b(conn)
+            self._sync_matrix_cache(conn)
 
             # 1. L3 强力置顶捞取
             max_pinned = int(self.config.get("max_pinned_l3", 15))
@@ -768,17 +947,31 @@ class MemoryRetriever:
 
             # 2. 第一阶段粗排召回
             pool_limit = int(self.config.get("recall_pool_limit", 500))
+            # 矩阵缓存可用时不再拉取 embedding_blob（省掉全表 struct.unpack）
+            matrix_usable = bool(
+                self._matrix_cache is not None and self._matrix_cache.built
+            )
             l2_pool = self._fetch_l2_pool(
                 conn=conn,
                 session_id=session_id,
                 pool_limit=pool_limit,
+                with_embedding=not matrix_usable,
             )
+
+            # 方案 B-1：优先走 FTS5 倒排 MATCH + bm25；无命中则回退 Python BM25
+            fts_scores = self._fts_keyword_scores(
+                conn=conn,
+                query=clean_query,
+                limit=pool_limit,
+            )
+
             candidates, query_vec = await self._first_stage_recall(
                 query=clean_query,
                 l2_pool=l2_pool,
                 pinned_ids=pinned_ids,
                 pinned_contents=pinned_contents,
                 candidate_k=effective_candidate_k,
+                fts_scores=fts_scores or None,
             )
 
             # 3. 第二阶段精排重排序

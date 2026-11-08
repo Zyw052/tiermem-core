@@ -49,6 +49,18 @@ except ImportError:
     except ImportError:  # pragma: no cover
         from storage import MemoryStorage as StorageManager  # type: ignore
 
+# 方案 B：FTS5 预分词工具（用于写入路径同步倒排索引文本）
+try:
+    from .storage import fts_preprocess as _fts_preprocess
+except ImportError:  # pragma: no cover
+    try:
+        from storage import fts_preprocess as _fts_preprocess  # type: ignore
+    except ImportError:
+
+        def _fts_preprocess(text: Any) -> str:  # type: ignore
+            """FTS5 不可用时的空实现，保证写入路径零依赖。"""
+            return ""
+
 
 L3_PIN_KEYWORDS: Tuple[str, ...] = (
     "喜欢",
@@ -166,6 +178,84 @@ class MemorySummarizer:
         except Exception as exc:  # pragma: no cover - 极端兜底
             logger.warning("[MemorySummarizer] HTTP 连接池初始化失败，将回退临时 Session: %s", exc)
 
+        # ---- 方案 B-3：task_dlq 死信队列闭环（巡检 + 指数退避重试 + 状态流转）----
+        self.dlq_enabled: bool = self._parse_bool(self.config, "dlq_retry_enabled", True)
+        self.dlq_interval: float = self._parse_float(
+            self.config, "dlq_retry_interval", 60.0, minimum=1.0
+        )
+        self.dlq_batch_size: int = self._parse_int(
+            self.config, "dlq_batch_size", 10, minimum=1
+        )
+        self.dlq_base_backoff: float = self._parse_float(
+            self.config, "dlq_base_backoff", 60.0, minimum=1.0
+        )
+        self.dlq_max_backoff: float = self._parse_float(
+            self.config, "dlq_max_backoff", 3600.0, minimum=1.0
+        )
+        self.dlq_max_retries: int = self._parse_int(
+            self.config, "dlq_max_retries", 3, minimum=1
+        )
+        self._dlq_task: Optional[asyncio.Task] = None
+        self._dlq_inflight: set[str] = set()
+        # 可观测性统计
+        self._stat_dlq_retried: int = 0    # 累计被重新捞取的死信次数
+        self._stat_dlq_completed: int = 0  # 重试成功转 completed
+        self._stat_dlq_failed: int = 0     # 超过 max_retries 转 failed
+        self._stat_dlq_rescheduled: int = 0  # 失败后重新排队
+
+    # ------------------------------------------------------------------
+    # 配置解析辅助（容错：任何非法值都退回默认，绝不因配置抛异常）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_bool(config: Dict[str, Any], key: str, default: bool) -> bool:
+        """解析布尔配置，支持 true/false/1/0/yes/no/on/off 字符串。"""
+        raw: Any = config.get(key)
+        if raw is None or raw == "":
+            summarizer_cfg = config.get("summarizer")
+            if isinstance(summarizer_cfg, dict):
+                raw = summarizer_cfg.get(key)
+        if raw is None or raw == "":
+            return default
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+    @staticmethod
+    def _parse_float(
+        config: Dict[str, Any], key: str, default: float, minimum: float = 0.0
+    ) -> float:
+        """解析浮点配置，非法/过低时安全回退。"""
+        candidates: List[Any] = [config.get(key)]
+        summarizer_cfg = config.get("summarizer")
+        if isinstance(summarizer_cfg, dict):
+            candidates.append(summarizer_cfg.get(key))
+        for raw in candidates:
+            if raw is None or raw == "":
+                continue
+            try:
+                return max(minimum, float(raw))
+            except (TypeError, ValueError):
+                continue
+        return default
+
+    @staticmethod
+    def _parse_int(
+        config: Dict[str, Any], key: str, default: int, minimum: int = 0
+    ) -> int:
+        """解析整数配置，非法/过低时安全回退。"""
+        candidates: List[Any] = [config.get(key)]
+        summarizer_cfg = config.get("summarizer")
+        if isinstance(summarizer_cfg, dict):
+            candidates.append(summarizer_cfg.get(key))
+        for raw in candidates:
+            if raw is None or raw == "":
+                continue
+            try:
+                return max(minimum, int(raw))
+            except (TypeError, ValueError):
+                continue
+        return default
+
     @staticmethod
     def _parse_idle_flush(config: Dict[str, Any]) -> int:
         """
@@ -237,11 +327,16 @@ class MemorySummarizer:
             self._idle_task = asyncio.create_task(
                 self._idle_sweeper_loop(), name="agent_memory_idle_sweeper"
             )
+        # 方案 B-3：启动死信队列巡检重试守护（形成真正的 DLQ 闭环）
+        if self.dlq_enabled and (self._dlq_task is None or self._dlq_task.done()):
+            self._dlq_task = asyncio.create_task(
+                self._dlq_retry_loop(), name="agent_memory_dlq_retry"
+            )
         logger.info(
-            "[MemorySummarizer] Async worker started (idle_flush=%ss).",
+            "[MemorySummarizer] Async worker started (idle_flush=%ss, dlq_retry=%s).",
             self.idle_flush_seconds,
+            f"{self.dlq_interval:.0f}s" if self.dlq_enabled else "off",
         )
-
     async def stop(self, flush: bool = True, drain_timeout: float = 5.0) -> None:
         """
         优雅停止后台异步消费 Task。
@@ -302,6 +397,19 @@ class MemorySummarizer:
             finally:
                 self._idle_task = None
 
+        # 4.1 方案 B-3：取消死信队列巡检守护
+        if self._dlq_task is not None:
+            self._dlq_task.cancel()
+            try:
+                await self._dlq_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning("[MemorySummarizer] Error while stopping dlq retry loop: %s", exc)
+            finally:
+                self._dlq_task = None
+        self._dlq_inflight.clear()
+
         # 5. 释放 HTTP 连接池（R-06）
         await self.close_http()
 
@@ -355,6 +463,279 @@ class MemorySummarizer:
                 break
             except Exception as exc:  # pragma: no cover - 守护线程绝不崩溃
                 logger.warning("[MemorySummarizer] idle sweeper 异常（已忽略）: %s", exc)
+
+    # ------------------------------------------------------------------
+    # 方案 B-3：task_dlq 死信队列闭环（巡检 → 重投 → 指数退避 → 终态）
+    # ------------------------------------------------------------------
+    async def _dlq_retry_loop(self) -> None:
+        """
+        死信队列后台巡检协程。
+
+        此前 task_dlq 是「只写不读」的黑洞，失败任务永久埋葬。本协程按
+        ``dlq_retry_interval`` 周期扫描到期死信并尝试重新消费，使其形成闭环。
+        """
+        tick = max(1.0, min(30.0, self.dlq_interval / 2.0))
+        logger.info(
+            "[MemorySummarizer] DLQ 重试守护已启动 (interval=%.0fs, batch=%d, "
+            "base_backoff=%.0fs, max_retries=%d)",
+            self.dlq_interval,
+            self.dlq_batch_size,
+            self.dlq_base_backoff,
+            self.dlq_max_retries,
+        )
+        while self._running:
+            try:
+                await asyncio.sleep(tick)
+                if not self._running:
+                    break
+                result = await self.sweep_dlq_once()
+                if result.get("scanned"):
+                    logger.info(
+                        "[MemorySummarizer] DLQ 巡检: scanned=%d completed=%d "
+                        "rescheduled=%d failed=%d skipped=%d",
+                        result["scanned"],
+                        result["completed"],
+                        result["rescheduled"],
+                        result["failed"],
+                        result["skipped"],
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:  # pragma: no cover - 守护协程绝不崩溃
+                logger.warning("[MemorySummarizer] DLQ 重试守护异常（已忽略）: %s", exc)
+
+    def _fetch_due_dlq(self, now: float, limit: int) -> List[sqlite3.Row]:
+        """拉取到期且仍有重试余量的 pending 死信任务（按到期时间升序）。"""
+        if self.storage is None or not hasattr(self.storage, "connect"):
+            return []
+        try:
+            conn = self.storage.connect()
+            return conn.execute(
+                """
+                SELECT task_id, task_type, scope_key, payload_json, error_msg,
+                       retry_count, max_retries, status, next_retry_at
+                FROM task_dlq
+                WHERE status = 'pending'
+                  AND next_retry_at <= ?
+                  AND retry_count < max_retries
+                ORDER BY next_retry_at ASC
+                LIMIT ?
+                """,
+                (float(now), int(limit)),
+            ).fetchall()
+        except Exception as exc:
+            logger.debug("[MemorySummarizer] 拉取 DLQ 任务失败（忽略）: %s", exc)
+            return []
+
+    def _finalize_dlq(
+        self,
+        task_id: str,
+        status: str,
+        error_msg: Optional[str] = None,
+        retry_count: Optional[int] = None,
+        next_retry_at: Optional[float] = None,
+    ) -> bool:
+        """把单条死信任务推进到终态或新的等待态（幂等，失败仅记日志）。"""
+        if self.storage is None or not hasattr(self.storage, "connect"):
+            return False
+        try:
+            conn = self.storage.connect()
+            now = time.time()
+            sets = ["status = ?", "updated_at = ?"]
+            params: List[Any] = [str(status), now]
+            if retry_count is not None:
+                sets.append("retry_count = ?")
+                params.append(int(retry_count))
+            if next_retry_at is not None:
+                sets.append("next_retry_at = ?")
+                params.append(float(next_retry_at))
+            if error_msg is not None:
+                sets.append("error_msg = ?")
+                params.append(str(error_msg)[:1000])
+            params.append(str(task_id))
+            with conn:
+                conn.execute(
+                    f"UPDATE task_dlq SET {', '.join(sets)} WHERE task_id = ?", params
+                )
+            return True
+        except Exception as exc:
+            logger.warning("[MemorySummarizer] 更新 DLQ 状态失败 task=%s: %s", task_id, exc)
+            return False
+
+    def _fail_exhausted_dlq(self, now: Optional[float] = None) -> int:
+        """
+        兜底清理：把「仍为 pending 但重试次数已耗尽」的历史脏数据标记为 failed，
+        避免其永远停留在扫描条件之外。返回处理条数。
+        """
+        if self.storage is None or not hasattr(self.storage, "connect"):
+            return 0
+        try:
+            conn = self.storage.connect()
+            with conn:
+                cur = conn.execute(
+                    """
+                    UPDATE task_dlq
+                    SET status = 'failed', updated_at = ?
+                    WHERE status = 'pending' AND retry_count >= max_retries
+                    """,
+                    (float(now if now is not None else time.time()),),
+                )
+                count = int(cur.rowcount or 0)
+            if count:
+                self._stat_dlq_failed += count
+                logger.info("[MemorySummarizer] %d 条超限 DLQ 任务已标记 failed", count)
+            return count
+        except Exception as exc:
+            logger.debug("[MemorySummarizer] 清理超限 DLQ 失败（忽略）: %s", exc)
+            return 0
+
+    def _reschedule_dlq(self, row: sqlite3.Row, error_msg: str, now: float) -> str:
+        """
+        重试失败后重新排期：指数退避 or 直接终态。
+
+        :return: ``"rescheduled"`` 或 ``"failed"``
+        """
+        task_id = str(row["task_id"])
+        retry_count = int(row["retry_count"] or 0) + 1
+        max_retries = int(row["max_retries"] or self.dlq_max_retries)
+        if retry_count >= max_retries:
+            self._finalize_dlq(
+                task_id, "failed", error_msg=error_msg, retry_count=retry_count
+            )
+            self._stat_dlq_failed += 1
+            logger.warning(
+                "[MemorySummarizer] DLQ 达到最大重试次数，标记 failed task=%s retries=%d err=%s",
+                task_id,
+                retry_count,
+                error_msg[:200],
+            )
+            return "failed"
+
+        # 指数退避：base * 2^(retry_count-1)，并受 max_backoff 封顶
+        delay = min(
+            self.dlq_max_backoff,
+            self.dlq_base_backoff * (2 ** (retry_count - 1)),
+        )
+        self._finalize_dlq(
+            task_id,
+            "pending",
+            error_msg=error_msg,
+            retry_count=retry_count,
+            next_retry_at=now + delay,
+        )
+        self._stat_dlq_rescheduled += 1
+        logger.info(
+            "[MemorySummarizer] DLQ 重试失败，%.0fs 后再试 task=%s retries=%d/%d err=%s",
+            delay,
+            task_id,
+            retry_count,
+            max_retries,
+            error_msg[:200],
+        )
+        return "rescheduled"
+
+    async def sweep_dlq_once(self, now: Optional[float] = None) -> Dict[str, int]:
+        """
+        执行一轮死信队列巡检与消费（可由守护协程周期调用，也可手动/测试触发）。
+
+        状态流转：
+        - 消费成功 → ``completed``
+        - 失败且仍有重试余量 → ``pending`` + 指数退避的 ``next_retry_at``
+        - 失败且重试耗尽 → ``failed``
+
+        :return: {"scanned","completed","rescheduled","failed","skipped"}
+        """
+        result = {
+            "scanned": 0,
+            "completed": 0,
+            "rescheduled": 0,
+            "failed": 0,
+            "skipped": 0,
+        }
+        current = float(now if now is not None else time.time())
+
+        # 0. 历史超限脏数据先收敛到 failed 终态
+        result["failed"] += self._fail_exhausted_dlq(current)
+
+        rows = self._fetch_due_dlq(current, self.dlq_batch_size)
+        for row in rows:
+            task_id = str(row["task_id"])
+            if task_id in self._dlq_inflight:
+                result["skipped"] += 1
+                continue
+            self._dlq_inflight.add(task_id)
+            result["scanned"] += 1
+            self._stat_dlq_retried += 1
+            try:
+                try:
+                    payload = json.loads(str(row["payload_json"] or "{}"))
+                except Exception as parse_exc:
+                    self._finalize_dlq(
+                        task_id, "failed", error_msg=f"payload 解析失败: {parse_exc}"
+                    )
+                    result["failed"] += 1
+                    self._stat_dlq_failed += 1
+                    continue
+
+                if not isinstance(payload, dict) or not payload:
+                    self._finalize_dlq(task_id, "failed", error_msg="payload 非法或为空")
+                    result["failed"] += 1
+                    self._stat_dlq_failed += 1
+                    continue
+
+                task_type = str(row["task_type"] or "")
+                if task_type != "summarize_dialogue":
+                    self._finalize_dlq(
+                        task_id, "failed", error_msg=f"不支持的任务类型: {task_type}"
+                    )
+                    result["failed"] += 1
+                    self._stat_dlq_failed += 1
+                    continue
+
+                # 关键：raise_on_error=True，让失败上抛给本方法统一做退避排期，
+                # 避免 _process_batch 内部再写一条新 DLQ 造成「死信爆炸」。
+                await self._handle_event(payload, raise_on_error=True)
+
+                self._finalize_dlq(task_id, "completed")
+                result["completed"] += 1
+                self._stat_dlq_completed += 1
+                logger.info("[MemorySummarizer] DLQ 重试成功 task=%s", task_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                outcome = self._reschedule_dlq(row, str(exc), current)
+                result["failed" if outcome == "failed" else "rescheduled"] += 1
+            finally:
+                self._dlq_inflight.discard(task_id)
+
+        return result
+
+    def get_dlq_stats(self) -> Dict[str, Any]:
+        """返回死信队列分布与运行期重试统计（可观测性）。"""
+        stats: Dict[str, Any] = {
+            "enabled": bool(self.dlq_enabled),
+            "interval": self.dlq_interval,
+            "base_backoff": self.dlq_base_backoff,
+            "max_backoff": self.dlq_max_backoff,
+            "max_retries": self.dlq_max_retries,
+            "batch_size": self.dlq_batch_size,
+            "inflight": len(self._dlq_inflight),
+            "stat_retried": self._stat_dlq_retried,
+            "stat_completed": self._stat_dlq_completed,
+            "stat_rescheduled": self._stat_dlq_rescheduled,
+            "stat_failed": self._stat_dlq_failed,
+            "by_status": {},
+        }
+        if self.storage is not None and hasattr(self.storage, "connect"):
+            try:
+                conn = self.storage.connect()
+                rows = conn.execute(
+                    "SELECT status, COUNT(1) AS c FROM task_dlq GROUP BY status"
+                ).fetchall()
+                stats["by_status"] = {str(r["status"]): int(r["c"]) for r in rows}
+            except Exception as exc:
+                logger.debug("[MemorySummarizer] 统计 DLQ 失败（忽略）: %s", exc)
+        return stats
 
     async def enqueue_dialogue(
         self, session_id: str, user_text: str, assistant_text: str
@@ -559,7 +940,9 @@ class MemorySummarizer:
                 except ValueError:
                     pass
 
-    async def _handle_event(self, event: Dict[str, Any]) -> None:
+    async def _handle_event(
+        self, event: Dict[str, Any], raise_on_error: bool = False
+    ) -> None:
         """
         分发单个队列事件。
 
@@ -567,6 +950,9 @@ class MemorySummarizer:
           只调用 1 次事实抽取 LLM、1 次判定门禁、1 次批量 Embedding，
           彻底消除原先 ``for turn in turns`` 的 N+1 调用风暴；
         - 其他格式（兼容历史的单轮事件）：按单轮批处理路径处理。
+
+        :param raise_on_error: 方案 B-3 死信重试专用——为 True 时异常向上抛出，
+            由 :meth:`sweep_dlq_once` 统一做退避排期，避免重复写入新的 DLQ 记录。
         """
         if not isinstance(event, dict):
             logger.warning("[MemorySummarizer] Skip invalid event type: %s", type(event))
@@ -584,6 +970,7 @@ class MemorySummarizer:
                     }
                 ],
                 reason="single",
+                raise_on_error=raise_on_error,
             )
             return
 
@@ -597,6 +984,7 @@ class MemorySummarizer:
             session_id=session_id,
             turns=turns,
             reason=str(event.get("reason", "threshold") or "threshold"),
+            raise_on_error=raise_on_error,
         )
 
     def _ensure_storage_columns(self, conn: sqlite3.Connection) -> None:
@@ -623,6 +1011,8 @@ class MemorySummarizer:
                 ("status", "TEXT NOT NULL DEFAULT 'active'"),
                 ("superseded_by", "TEXT NOT NULL DEFAULT ''"),
                 ("superseded_at", "REAL NOT NULL DEFAULT 0.0"),
+                # 方案 B-1：FTS5 预分词文本列（触发器据此维护倒排索引）
+                ("fts_text", "TEXT NOT NULL DEFAULT ''"),
             ],
         }
         for table, cols in extended_cols.items():
@@ -1037,6 +1427,14 @@ class MemorySummarizer:
             if fact_text not in facts_list:
                 facts_list.append(fact_text)
 
+            # 方案 B-1：融合更新时同步预分词文本，触发器会据此刷新倒排索引
+            merged_content = (
+                fact_text
+                if len(fact_text) >= len(str(best_match_row["content"] or ""))
+                else str(best_match_row["content"] or "")
+            )
+            merged_fts_text = self._build_fts_text(merged_content, facts_list)
+
             with conn:
                 conn.execute(
                     """
@@ -1050,11 +1448,12 @@ class MemorySummarizer:
                         tier = ?,
                         embedding_blob = COALESCE(?, embedding_blob),
                         last_accessed_at = ?,
-                        updated_at = ?
+                        updated_at = ?,
+                        fts_text = ?
                     WHERE atom_id = ?
                     """,
                     (
-                        fact_text if len(fact_text) >= len(str(best_match_row["content"] or "")) else best_match_row["content"],
+                        merged_content,
                         json.dumps(facts_list, ensure_ascii=False),
                         new_imp,
                         new_access,
@@ -1064,9 +1463,12 @@ class MemorySummarizer:
                         emb_blob,
                         now,
                         now,
+                        merged_fts_text,
                         atom_id,
                     ),
                 )
+            # 方案 B-2：融合后把最新向量同步进内存矩阵（增量覆盖，无重建）
+            self._sync_embedding_cache(atom_id, embedding_vec)
             return atom_id, True
 
         atom_id = f"atom_{uuid.uuid4().hex[:16]}"
@@ -1074,6 +1476,8 @@ class MemorySummarizer:
             {"pinned": bool(pinned), "tier": tier, "atom_type": atom_type},
             ensure_ascii=False,
         )
+        # 方案 B-1：新原子写入预分词文本，INSERT 触发器据此建立倒排条目
+        new_fts_text = self._build_fts_text(fact_text, [fact_text])
         with conn:
             conn.execute(
                 """
@@ -1082,8 +1486,9 @@ class MemorySummarizer:
                     topics_json, key_facts_json, sentiment, importance,
                     access_count, embedding_blob, source_type, source_ref,
                     last_accessed_at, created_at, updated_at,
-                    atom_type, reinforcement_count, pinned, tier, metadata
-                ) VALUES (?, ?, ?, ?, '[]', ?, 'neutral', ?, 1, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    atom_type, reinforcement_count, pinned, tier, metadata,
+                    fts_text
+                ) VALUES (?, ?, ?, ?, '[]', ?, 'neutral', ?, 1, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
                 """,
                 (
                     atom_id,
@@ -1102,9 +1507,44 @@ class MemorySummarizer:
                     pinned,
                     tier,
                     meta_json,
+                    new_fts_text,
                 ),
             )
+        # 方案 B-2：新原子增量追加进内存矩阵（均摊 O(1)，不触发全量重建）
+        self._sync_embedding_cache(atom_id, embedding_vec)
         return atom_id, False
+
+    # ------------------------------------------------------------------
+    # 方案 B：引擎增强所需的写入侧维护辅助
+    # ------------------------------------------------------------------
+    def _build_fts_text(self, content: Any, key_facts: Any = None) -> str:
+        """
+        生成 FTS5 预分词文本；FTS5 不可用时返回空串（写入零额外开销）。
+        """
+        try:
+            if not getattr(self.storage, "fts5_enabled", False):
+                return ""
+            facts_text = ""
+            if isinstance(key_facts, (list, tuple)):
+                facts_text = " ".join(str(x) for x in key_facts)
+            elif key_facts:
+                facts_text = str(key_facts)
+            return _fts_preprocess(f"{content or ''} {facts_text}".strip())
+        except Exception as exc:  # pragma: no cover - 预分词失败不应影响入库
+            logger.debug("[MemorySummarizer] 生成 fts_text 失败（忽略）: %s", exc)
+            return ""
+
+    def _sync_embedding_cache(self, atom_id: str, vector: Sequence[float]) -> None:
+        """
+        把写入/更新后的向量同步进内存矩阵缓存（失败仅记日志，不影响入库）。
+        """
+        cache = getattr(self.storage, "embedding_cache", None)
+        if cache is None or not vector:
+            return
+        try:
+            cache.upsert(atom_id, vector)
+        except Exception as exc:  # pragma: no cover
+            logger.debug("[MemorySummarizer] 同步向量矩阵缓存失败（忽略）: %s", exc)
 
     # ------------------------------------------------------------------
     # 自作判定门禁：冲突候选拉取与旧事实废弃
@@ -1353,6 +1793,7 @@ class MemorySummarizer:
         session_id: str,
         turns: Sequence[Dict[str, Any]],
         reason: str = "threshold",
+        raise_on_error: bool = False,
     ) -> None:
         """
         批处理核心（R-03）：N 轮对话 → 1 个 Context Window → 1 次 LLM + 1 次门禁 + 1 次批量向量。
@@ -1504,6 +1945,10 @@ class MemorySummarizer:
                 exc,
                 exc_info=True,
             )
+            if raise_on_error:
+                # 方案 B-3：死信重试路径必须抛出，由 sweep_dlq_once 做退避排期，
+                # 否则每次重试失败都会再写一条新 DLQ，形成死信爆炸。
+                raise
             self._record_dlq(payload, str(exc))
 
     def _record_dlq(self, payload: Dict[str, Any], error_msg: str) -> None:
@@ -1511,6 +1956,17 @@ class MemorySummarizer:
         now = time.time()
         task_id = f"dlq_{uuid.uuid4().hex[:16]}"
         scope_key = str(payload.get("session_id", ""))
+        try:
+            payload_json = json.dumps(
+                payload, ensure_ascii=False, default=str, allow_nan=False
+            )
+        except Exception as serial_exc:
+            logger.error(
+                "[MemorySummarizer] DLQ payload 序列化失败，任务将仅记录日志 (%s): %s",
+                serial_exc,
+                error_msg,
+            )
+            return
         try:
             if self.storage is not None and hasattr(self.storage, "connect"):
                 conn = self.storage.connect()
@@ -1521,19 +1977,27 @@ class MemorySummarizer:
                             task_id, task_type, scope_key, payload_json,
                             error_msg, retry_count, max_retries, status,
                             next_retry_at, created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, 0, 3, 'pending', ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, 0, ?, 'pending', ?, ?, ?)
                         """,
                         (
                             task_id,
                             "summarize_dialogue",
                             scope_key,
-                            json.dumps(payload, ensure_ascii=False),
+                            payload_json,
                             str(error_msg)[:1000],
-                            now + 60.0,
+                            int(self.dlq_max_retries),
+                            # 首次重试同样遵循退避基数，避免瞬时故障被立即重放
+                            now + float(self.dlq_base_backoff),
                             now,
                             now,
                         ),
                     )
+                logger.info(
+                    "[MemorySummarizer] 任务已写入 DLQ task=%s retry_at=+%.0fs err=%s",
+                    task_id,
+                    self.dlq_base_backoff,
+                    str(error_msg)[:200],
+                )
                 return
         except Exception as db_exc:
             logger.error(

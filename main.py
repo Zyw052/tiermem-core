@@ -985,6 +985,21 @@ class AgentMemoryPlugin(Star):
                 status["table_counts"] = self.storage.get_table_counts()
             except Exception as exc:
                 logger.debug("[agent_memory] 获取表统计失败: %s", exc)
+        # ---- 方案 B：引擎升级可观测性快照（FTS5 / 向量矩阵 / 死信队列）----
+        try:
+            engine: Dict[str, Any] = {}
+            if self.storage is not None:
+                if hasattr(self.storage, "get_fts_stats"):
+                    engine["fts"] = self.storage.get_fts_stats()
+                cache = getattr(self.storage, "embedding_cache", None)
+                if cache is not None and hasattr(cache, "stats"):
+                    engine["matrix_cache"] = cache.stats()
+            if self.summarizer is not None and hasattr(self.summarizer, "get_dlq_stats"):
+                engine["dlq"] = self.summarizer.get_dlq_stats()
+            if engine:
+                status["engine"] = engine
+        except Exception as exc:
+            logger.debug("[agent_memory] 获取引擎状态失败: %s", exc)
         return status
 
     # ------------------------------------------------------------------

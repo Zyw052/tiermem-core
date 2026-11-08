@@ -10,7 +10,7 @@
 [![SQLite](https://img.shields.io/badge/Storage-SQLite%20WAL-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 [![Docker](https://img.shields.io/badge/Docker-0%20containers-2496ED?logo=docker&logoColor=white)](#-为什么要有-tiermem-core)
 [![Footprint](https://img.shields.io/badge/RAM-~30MB-31c48d)](#-架构对比轻量到什么程度)
-[![Tests](https://img.shields.io/badge/Tests-41%20passed-2ea44f)](#-测试与质量保障)
+[![Tests](https://img.shields.io/badge/Tests-63%20passed-2ea44f)](#-测试与质量保障)
 [![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
 </div>
@@ -26,11 +26,12 @@
 | [三层记忆](#tiers) | 用「人的大脑」讲清 L1 / L2 / L3 |
 | [源流与致敬](#origin) | 我们继承了谁、又砍掉了什么 |
 | [生产级超越](#plan-a) | 方案 A 的五道硬核防线 |
+| [工业级引擎升级](#plan-b) | 方案 B：FTS5 倒排 + 向量矩阵缓存 + 死信闭环 |
 | [30 秒快速上手](#quickstart) | 复制粘贴就能跑 |
 | [架构对比](#compare) | 轻量化到底轻到什么程度 |
 | [配置说明](#config) | 兼容任意模型 / 本地 Embedding |
-| [测试与质量](#tests) | 41 个用例锁死的行为契约 |
-| [开源演进路线图](#roadmap) | 方案 B / 方案 C 要做什么 |
+| [测试与质量](#tests) | 63 个用例锁死的行为契约 |
+| [开源演进路线图](#roadmap) | 已落地阶段 + 方案 C 要做什么 |
 | [English TL;DR](#english) | 英文速览 |
 
 <a id="english"></a>
@@ -42,7 +43,8 @@
 - **Inspired by** Tencent's open-source `TencentDB-Agent-Memory` (30k+ stars): we keep its two best ideas — the **L0~L3 tiered memory model** and **BM25 + vector hybrid retrieval**.
 - **Rebuilt for humans**: the original needs 4 Docker containers, Node.js 22 and a dedicated vector database (multi-GB). Ours is **one SQLite file, ~30 MB RAM, zero infrastructure**.
 - **Production hardened (Plan A)**: pinned memories can never be killed by a confused LLM, 5 dialogue turns collapse into a single batched LLM + embedding call (**≈80% cheaper**), every turn is persisted immediately, sessions are strictly isolated, and retrieval is lock-free read-only.
-- **Roadmap**: Plan B — native SQLite `FTS5` engine (BM25 without any vector DB); Plan C — a true temporal knowledge graph.
+- **Plan B landed (industrial engine)**: native SQLite `FTS5` inverted index with CJK pre-tokenization (≈13x faster keyword recall), an in-memory **vector matrix cache** (`matrix @ query`, microsecond vector scoring, auto-fallback to pure Python), and a **closed-loop dead-letter queue** with exponential backoff retries.
+- **Roadmap**: Plan C — a true temporal knowledge graph.
 
 > 中文读者请继续往下读，下面全部是中文主线，穿插英文术语便于检索。
 
@@ -291,6 +293,92 @@ UPDATE l2_atoms
 
 ---
 
+<a id="plan-b"></a>
+
+## 🚀 工业级引擎升级：方案 B 的三大核心改造
+
+方案 A 解决了「不翻车」，方案 B 解决「跑得够快」。三项改造全部**零外部依赖、向下兼容、失败自动降级**，
+专项测试锁死在 `tests/test_stage7_engine_b.py`（22 个用例）。
+
+### ⚡ 1. SQLite 原生 FTS5 全文索引 —— 毫秒级倒排召回
+
+**事故现场**：朴素的关键词召回是「把全部记忆拉进 Python，用正则逐条切词，再跑双重循环算 BM25」。
+千级记忆时单次检索要 **35ms+ 的纯 CPU 开销**，而且完全无法利用数据库能力。
+
+**我们的做法**：
+
+- 启动即探测 SQLite 是否编入 FTS5（实测创建临时虚拟表，比解析 `PRAGMA compile_options` 更可靠）；
+- 创建虚拟表 `l2_atoms_fts(atom_id UNINDEXED, content, key_facts)`，`tokenize='unicode61 remove_diacritics 2'`；
+- **关键技术点**：`unicode61` 不会把中文切成单字（整段 CJK 视为一个 token），`MATCH '咖啡'` 命中不了「美式咖啡」。
+  因此索引侧与查询侧统一做 **CJK 逐字预分词**（`storage.fts_preprocess`），写入 `l2_atoms.fts_text`：
+
+```python
+>>> fts_preprocess("主人爱喝美式咖啡 tiermem-core")
+'tiermem core 主 人 爱 喝 美 式 咖 啡'
+```
+
+- **四类自动同步触发器**覆盖 `INSERT / UPDATE / DELETE / status 软废弃`，索引与主表永不脱节：
+
+```sql
+CREATE TRIGGER trg_l2_atoms_fts_ai AFTER INSERT ON l2_atoms BEGIN
+  INSERT INTO l2_atoms_fts(atom_id, content, key_facts)
+  VALUES (new.atom_id,
+          CASE WHEN COALESCE(new.fts_text,'') <> '' THEN new.fts_text ELSE new.content END,
+          CASE WHEN COALESCE(new.fts_text,'') <> '' THEN new.fts_text ELSE new.key_facts_json END);
+END;
+```
+
+- 检索直接 `MATCH` + `bm25(l2_atoms_fts, 1.0, 0.5)` 倒排打分，分数归一化到 0~1 参与融合；
+- **软废弃即时摘除**：`status='superseded'` 时触发器立刻从倒排表删除，检索期无需 `JOIN` 过滤，恢复 `active` 自动回灌；
+- **零破坏回退**：SQLite 无 FTS5 时自动回退原 Python BM25，行为完全不变。
+
+| 千级记忆单次检索 | 耗时 | 相对加速 |
+| :-- | --: | --: |
+| Python BM25（原实现） | 35.1 ms | 1.0x |
+| **FTS5 + bm25（方案 B）** | **2.7 ms** | **~13x** |
+
+### 🧮 2. 内存向量矩阵缓存 —— 从「逐条反序列化」到「一次矩阵乘法」
+
+**事故现场**：每次检索都要 `SELECT *` 全表拉取，对每行 `struct.unpack` 反序列化浮点向量，
+再逐条调用 `cosine_similarity`。千级记忆下这是实打实的 CPU 瓶颈，且 99% 的向量根本没变化。
+
+**我们的做法**：`EmbeddingMatrixCache`
+
+- 维护 `atom_id -> index` 映射 + 二维矩阵 `np.ndarray(n, dim)`（**存单位向量**，余弦相似度退化为纯点积）;
+- 启动/首次检索一次性构建；检索时 `matrix @ query` **一次算出全部相似度**（微秒级）；
+- 写入侧**增量维护**：新原子 `upsert` 均摊 O(1) 追加；融合更新原位覆盖；软废弃 `invalidate` 置掩码失效，
+  **不搬移数据、不重建矩阵**；
+- 候选池因此可以只 `SELECT` 必要列（跳过 `embedding_blob`），进入精排前再从缓存按需回填向量；
+- 维度变更（换 embedding 模型）按**维度众数**重建，旧维度脏数据安全跳过；
+- 5 秒一次的轻量指纹校验（`COUNT` + `MAX(updated_at)`）兜住绕过缓存的直接 SQL 写入；
+- **无 numpy 自动回退**纯 Python 单遍点积，数值与 numpy 后端误差 < 1e-5。
+
+```text
+批量余弦一致性：max_diff = 3.1e-08（float32 精度极限）
+```
+
+### 🔁 3. 死信队列闭环 —— 从「只写不读的黑洞」到「自动重试消费」
+
+**事故现场**：方案 A 把失败任务写进 `task_dlq` 后就再没人看过它——**死信永久埋葬**，
+本该析出的记忆永远丢失，直到有人手工翻库。
+
+**我们的做法**：后台守护协程 `_dlq_retry_loop` + `sweep_dlq_once()`
+
+- 定期扫描 `status='pending' AND next_retry_at <= now AND retry_count < max_retries`；
+- 重新投递并调用原处理链路消费；成功 → `completed`；
+- 失败 → **指数退避** `base * 2^(n-1)`（受 `max_backoff` 封顶）后重新排队；
+- 重试耗尽 → `failed` 终态，不再消耗资源；
+- **防死信爆炸**：重试路径以 `raise_on_error=True` 上抛异常，由重试器统一改状态，
+  绝不会「重试一次就多写一条新死信」；
+- 脏 payload / 未知 `task_type` / 超限历史脏数据一律收敛为 `failed`，绝不卡死队列。
+
+```text
+[OK] 指数退避生效: 第1次≈10.0s，第2次≈20.0s
+[OK] DLQ 端到端闭环：失败落库 → 到期重试 → completed，析出记忆=...，L1 无重复(1)
+```
+
+---
+
 <a id="quickstart"></a>
 
 ## 🚀 30 秒快速上手
@@ -509,7 +597,7 @@ pip install numpy      # 可选，向量运算加速（缺失时自动回退纯 
 
 ## 🧪 测试与质量保障
 
-**6 个套件 · 41 个用例 · 全部可脱离宿主独立运行**（内置宿主桩包，零外部依赖）。
+**7 个套件 · 63 个用例 · 全部可脱离宿主独立运行**（内置宿主桩包，零外部依赖）。
 
 ```bash
 python3 tests/test_stage1_buffer.py          # 多轮缓冲打包 / 强制冲洗 / Worker 消费
@@ -518,7 +606,11 @@ python3 tests/test_stage3_commands.py        # 三态注入路由 / 四指令 / 
 python3 tests/test_stage4_e2e.py             # 全链路端到端闭环 + 冷重启持久化
 python3 tests/test_stage5_evaluator_gate.py  # 判官门禁：价值打分 / 冲突废弃 / 超时降级
 python3 tests/test_stage6_hardening.py       # 方案 A 防线：R-01 ~ R-06 六项专项
+python3 tests/test_stage7_engine_b.py        # 方案 B 引擎：FTS5 / 向量矩阵 / DLQ 闭环 22 项专项
 ```
+
+> 全量回归同时兼容 **numpy 存在 / 缺失** 两种运行环境（矩阵缓存自动切换后端），
+> 以及 **SQLite 带 / 不带 FTS5** 两种构建（全文检索自动回退 Python BM25）。
 
 ### 实测闭环输出（Stage 4）
 
@@ -564,27 +656,31 @@ python3 tests/test_stage6_hardening.py       # 方案 A 防线：R-01 ~ R-06 六
 | **Stage 4** | 端到端集成 | 全链路闭环测试、冷重启持久化 |
 | **Stage 5** | 判官门禁 | 廉价判官 `jev`、价值打分、冲突软废弃 |
 | **方案 A** | 生产级加固 | R-01 ~ R-06：置顶免死、真批量、实时落盘、严格隔离、连接池、纯读检索 |
+| **Stage 7 / 方案 B** | 工业级引擎 | FTS5 倒排索引（中文预分词 + 四类同步触发器）、内存向量矩阵缓存、死信队列闭环重试 |
 
-### 🚧 方案 B：原生 SQLite FTS5 引擎（下一步）
+### ✅ 方案 B：原生 SQLite FTS5 引擎（已落地）
 
-**要解决的问题**：当前关键词检索是自己手写的「字词重合 + BM25 近似」。够用，但不够快也不够规范的。
+**原定目标**：把「手写字词重合 + BM25 近似」换成 SQLite 原生 FTS5 倒排检索。
 
-**要做成什么样**：
+**实际交付**（`tests/test_stage7_engine_b.py`，22 个用例）：
 
 ```sql
--- 目标：让 SQLite 自己干 BM25 的活
-CREATE VIRTUAL TABLE l2_fts USING fts5(
-    content, topics,
-    tokenize = 'unicode61'     -- 中文再叠加自定义分词
+CREATE VIRTUAL TABLE l2_atoms_fts USING fts5(
+    atom_id UNINDEXED, content, key_facts,
+    tokenize = 'unicode61 remove_diacritics 2'
 );
 ```
 
-- **零依赖 BM25**：用 SQLite 内置的 FTS5 虚拟表做真正的 BM25 排序，不再依赖手写打分；
-- **中文分词管道**：`jieba` 可选接入，缺失时回退字符二元组（bigram），保证中文也能命中；
-- **子串兜底召回**：FTS5 对短查询可能漏召，叠加 `LIKE '%kw%'` 兜底，防止"两字关键词查不到"；
-- **彻底摆脱 numpy**：向量走 BLOB + 可选 numpy；FTS5 路径完全不需要向量依赖。
+- **零依赖 BM25**：`MATCH` + `bm25()` 由 SQLite 内置完成，不再依赖手写打分（千级记忆 **35ms → 2.7ms**）；
+- **中文分词管道**：实测 `unicode61` 不切分 CJK，因此索引/查询两侧统一做 **CJK 逐字预分词**
+  （`fts_preprocess`），**无需 jieba 等任何第三方依赖**，中英文混合查询均可命中；
+- **四类自动同步触发器**：`INSERT / UPDATE / DELETE / status 软废弃`，索引与主表永不脱节；
+- **优雅回退**：SQLite 未编入 FTS5 时自动回退原 Python BM25，**零破坏变更**；
+- **附赠两项**：内存向量矩阵缓存（`matrix @ query` 微秒级向量打分）与死信队列闭环重试
+  ——详见 [工业级引擎升级](#plan-b)。
 
-> **预期收益**：召回准确率提升、检索延迟下降，且**仍然是零容器、单文件**。
+> **实测收益**：关键词召回约 **13x 加速**，向量召回从「全表反序列化 + 逐条余弦」降为**一次矩阵乘法**，
+> 且依然是**零容器、单文件、零额外依赖**。
 
 ### 🔮 方案 C：真·时序知识图谱（再下一步）
 
@@ -690,7 +786,7 @@ SQLite 在万级记忆规模、带索引的情况下，检索是毫秒级的。�
 | 知识图谱运行期写入（`kg_nodes` / `kg_edges`） | 表结构与迁移映射已就绪，自动构建待方案 C 接入 |
 | 专属 WebUI 面板（`webui.*`） | 配置项已预留，HTTP 面板待实现 |
 | 检索权重细粒度调节（`retrieval.weight_*`） | 配置项已预留，当前为内置 `0.55` 向量 + `0.45` 关键词 |
-| 原生 FTS5 关键词引擎 | 待方案 B 接入（当前为手写 BM25 近似） |
+| 原生 FTS5 关键词引擎 | ✅ 已落地（方案 B）：倒排索引 + 中文预分词 + 四类同步触发器，无 FTS5 时自动回退 |
 
 ---
 

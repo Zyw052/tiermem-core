@@ -81,6 +81,42 @@
         "description": "总结 LLM 模型名称",
         "type": "string",
         "default": ""
+      },
+      "dlq_retry_enabled": {
+        "description": "启用死信队列自动重试（方案B闭环）",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后后台守护会定期扫描 task_dlq 中到期的 pending 任务并重新消费，形成闭环"
+      },
+      "dlq_retry_interval": {
+        "description": "死信队列巡检间隔(秒)",
+        "type": "float",
+        "default": 60.0,
+        "hint": "每隔 N 秒扫描一次到期死信；建议 30~300 秒"
+      },
+      "dlq_batch_size": {
+        "description": "单轮巡检最大处理死信条数",
+        "type": "int",
+        "default": 10,
+        "hint": "控制单次巡检的消费量，避免重试风暴占用队列"
+      },
+      "dlq_base_backoff": {
+        "description": "死信重试退避基数(秒)",
+        "type": "float",
+        "default": 60.0,
+        "hint": "指数退避：第 n 次重试等待 base * 2^(n-1) 秒"
+      },
+      "dlq_max_backoff": {
+        "description": "死信重试退避上限(秒)",
+        "type": "float",
+        "default": 3600.0,
+        "hint": "指数退避的封顶值，防止等待时间无限增长"
+      },
+      "dlq_max_retries": {
+        "description": "死信最大重试次数",
+        "type": "int",
+        "default": 3,
+        "hint": "达到该次数后任务标记为 failed 终态，不再重试"
       }
     }
   },
@@ -289,6 +325,18 @@
         "type": "int",
         "default": 200,
         "hint": "内存中累计的访问计数达到该条数时立即触发一次异步刷盘"
+      },
+      "recall_pool_limit": {
+        "description": "向量/关键词粗排候选池上限（条）",
+        "type": "int",
+        "default": 500,
+        "hint": "第一阶段召回从最近 N 条记忆中粗排；千级记忆建议保持 500~1000"
+      },
+      "matrix_cache_sync_interval": {
+        "description": "向量矩阵缓存一致性校验间隔（秒）",
+        "type": "float",
+        "default": 5.0,
+        "hint": "方案B内存向量矩阵缓存：定期比对数据库指纹以感知外部写入；0 表示每次检索都校验（牺牲少量性能换绝对一致）"
       }
     }
   },
