@@ -1,115 +1,326 @@
-# astrbot_plugin_agent_memory
+<div align="center">
 
-**智涌原生分层记忆插件** — 为 AstrBot 提供 L1/L2/L3 三层结构化记忆、多轮缓冲异步总结、两阶段混合检索与三态 Prompt 注入能力。
+# 🧠 TierMem Core
 
-全部数据落地于本地 SQLite（WAL 模式），**零外部服务依赖即可运行**（未配置模型密钥时自动降级为规则抽取 + 关键词检索 + 本地 RRF 重排）。
+### 给你的 AI Agent 装一套「不会失忆、也不会乱编」的大脑
 
----
+**极简 · 零容器 · 防幻觉 · 纯 Python 的分层长期记忆内核**
 
-## 1. 功能特性
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![SQLite](https://img.shields.io/badge/Storage-SQLite%20WAL-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
+[![Docker](https://img.shields.io/badge/Docker-0%20containers-2496ED?logo=docker&logoColor=white)](#-为什么要有-tiermem-core)
+[![Footprint](https://img.shields.io/badge/RAM-~30MB-31c48d)](#-架构对比轻量到什么程度)
+[![Tests](https://img.shields.io/badge/Tests-41%20passed-2ea44f)](#-测试与质量保障)
+[![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
-### 1.1 三层记忆体系
+</div>
 
-| 层级 | 存储表 | 内容 | 产生方式 |
-| :-- | :-- | :-- | :-- |
-| **L1 工作区** | `l1_docs` | 原始对话轮次（`doc_type=dialogue_turn`），保留 User/Assistant 全量文本 | 每轮对话入队后由后台 Worker 写入 |
-| **L2 情景原子** | `l2_atoms` | 从对话中提炼的独立事实原子，带 topics / key_facts / 重要度 / 向量 / 访问计数 | 事实抽取 → 向量化 → 余弦去重融合 |
-| **L3 核心画像** | `l2_atoms`（`pinned=1, tier=3`） | 偏好、习惯、硬性约束等必须长期遵守的核心记忆，检索时**强力置顶** | 含 L3 关键词或重要度 ≥ 0.85 时自动晋升 |
+<a id="nav"></a>
 
-> **L3 自动晋升关键词**：`喜欢` / `讨厌` / `偏好` / `必须` / `严禁` / `密码` / `习惯`。
-> 命中即 `importance=0.90`、`pinned=1`、`tier=3`，无需人工干预。
+## 📖 目录
 
-### 1.2 多轮缓冲 + 异步总结（不阻塞对话）
+| 章节 | 你会看到什么 |
+| :-- | :-- |
+| [为什么要有 TierMem Core](#why) | 为什么你的机器人像个金鱼 |
+| [一句话定位](#pitch) | 这玩意儿到底是干嘛的 |
+| [三层记忆](#tiers) | 用「人的大脑」讲清 L1 / L2 / L3 |
+| [源流与致敬](#origin) | 我们继承了谁、又砍掉了什么 |
+| [生产级超越](#plan-a) | 方案 A 的五道硬核防线 |
+| [30 秒快速上手](#quickstart) | 复制粘贴就能跑 |
+| [架构对比](#compare) | 轻量化到底轻到什么程度 |
+| [配置说明](#config) | 兼容任意模型 / 本地 Embedding |
+| [测试与质量](#tests) | 41 个用例锁死的行为契约 |
+| [开源演进路线图](#roadmap) | 方案 B / 方案 C 要做什么 |
+| [English TL;DR](#english) | 英文速览 |
 
-- 每轮对话**只进内存缓冲池**，零 IO、零阻塞；
-- 累积满 `summary_turn_interval`（默认 5 轮）才**整窗打包**为 `kind=batch` 事件推入后台队列，显著降低 LLM 调用次数；
-- 不足阈值的尾部轮次由 `flush_session()` / `flush_all()` 强制冲洗，**会话结束/插件卸载不丢记忆**；
-- 背包后台 Worker 基于 `asyncio.Queue`，单轮处理失败不阻断整批，异常统一降级写入 `task_dlq` 死信队列。
+<a id="english"></a>
 
-### 1.3 两阶段混合检索
+## 🌐 English TL;DR
 
-```
-Query ──► ① L3 强力置顶捞取（pinned=1，按 importance 排序，当前会话优先）
-      ──► ② 第一阶段粗排：向量余弦召回 Top-N  ⊕  关键词 BM25/字词重合召回 Top-N
-                              （去重合并，0.55 向量 + 0.45 关键词融合）
-      ──► ③ 第二阶段精排：BGE-Reranker 深度打分  （无密钥时降级为本地 RRF 融合）
-      ──► ④ 组装 Markdown 记忆块 + 更新命中项访问计数
-```
+**TierMem Core** is a lightweight, zero-container, anti-hallucination **tiered long-term memory kernel** for AI agents, written in pure Python.
 
-### 1.4 双向 LLM 钩子与静默降级
+- **Inspired by** Tencent's open-source `TencentDB-Agent-Memory` (30k+ stars): we keep its two best ideas — the **L0~L3 tiered memory model** and **BM25 + vector hybrid retrieval**.
+- **Rebuilt for humans**: the original needs 4 Docker containers, Node.js 22 and a dedicated vector database (multi-GB). Ours is **one SQLite file, ~30 MB RAM, zero infrastructure**.
+- **Production hardened (Plan A)**: pinned memories can never be killed by a confused LLM, 5 dialogue turns collapse into a single batched LLM + embedding call (**≈80% cheaper**), every turn is persisted immediately, sessions are strictly isolated, and retrieval is lock-free read-only.
+- **Roadmap**: Plan B — native SQLite `FTS5` engine (BM25 without any vector DB); Plan C — a true temporal knowledge graph.
 
-| 钩子 | 时机 | 职责 |
-| :-- | :-- | :-- |
-| `on_llm_request` | LLM 请求前 | 两阶段检索 → 按注入策略写入 `system_prompt` / `prompt` |
-| `on_llm_response` | LLM 响应后 | 抽取「用户输入 + 机器人回复」压入多轮缓冲池 |
-| `on_decorating_result` | 发送前 | **仅在宿主缺少 `on_llm_response` 时**作为兜底记录点 |
-
-**保障机制**：全量 `try-except`，检索超时（默认 3s）即放弃注入；任何异常都不影响 AstrBot 正常对话流。
-**过滤规则**：流式分片（`is_chunk=True`）与工具调用轮（`tools_call_name` 非空）不记录；同会话相同内容 2 秒内只记一次（抵御宿主重复回调）。
-**注入幂等**：记忆块携带隐藏标记 `<!-- agent_memory:injected:v1 -->`，同一请求（含工具调用多轮）绝不重复注入。
+> 中文读者请继续往下读，下面全部是中文主线，穿插英文术语便于检索。
 
 ---
 
-### 1.5 自作判定门禁（Evaluator Gate）
+<a id="why"></a>
 
-在 L2 原子事实入库前插入一层“廉价模型预判定”，用极小成本挡住噪声、守住一致性：
+## 🤔 为什么要有 TierMem Core
 
-- **信息价值打分**：`value_score` 过滤寒暄、语气应答与无信息量废话（默认阈值 `0.35`）；
-- **事实冲突与推翻检测**：识别“我不喜欢喝绿茶”这类与旧事实矛盾的新事实，把被推翻的旧原子标记为
-  `status='superseded'` 软废弃（保留可追溯性，检索侧不再召回）；
-- **异常平滑降级**：判官模型超时 / 报错 / 返回非法 JSON 时自动回退本地规则判定，
-  主记忆流程**永不阻断**（`fail-open` 默认开启，宁多记不丢记忆）；
-- **判官模型**：默认 `jev`，`api_base` / `api_key` 留空时自动复用 `summarizer.*` 凭证，无需重复填写。
+### 你的 AI 有点像个金鱼
 
-### 1.6 方案 A 止血热修（稳定性加固）
+大模型没有「记忆」这个器官。每一次 API 请求，对它来说都是**一次全新的投胎**。
 
-针对上线风险清单做了 6 项根治，全部有 Stage 6 专项用例锁定：
+你昨天跟它聊了两小时，今天它开口第一句是「你好，我是 AI 助手，有什么可以帮你？」
 
-| 编号 | 风险 | 修复要点 |
+这不是它笨，是它**真的不记得**。
+
+### 开发者的四种「土办法」，都不太灵
+
+| 土办法 | 听起来还行 | 实际踩的坑 |
 | :-- | :-- | :-- |
-| **R-01** | 置顶记忆被误杀 | L3 `pinned=1` 拥有免死金牌：规则层跳过置顶候选，软废弃 SQL 追加 `AND COALESCE(pinned,0)=0` |
-| **R-02** | 未满阈值对话蒸发 | `enqueue_dialogue` 即**实时落盘 L1**；析出 L2 后回写 `l2_processed`；新增 idle 超时自动刷盘 |
-| **R-03** | N+1 调用账单风暴 | N 轮合并为**一个 Context Window**：1 次事实抽取 + 1 次门禁 + 1 次批量 Embedding |
-| **R-04** | 跨群/私聊串台 | `strict_session_isolation` **默认开启**，仅 `scope_key='global'` 允许全局召回 |
-| **R-05** | 检索抢 SQLite 写锁 | 检索链路纯读，命中计数内存累加 + 异步定期刷盘（`close()` 兜底刷净） |
-| **R-06** | 频繁 TLS 握手 | Embedding / Rerank / 判官 / 总结均复用持久 `aiohttp.ClientSession` 连接池 |
+| **把历史全塞进 Prompt** | 最省事 | Token 费爆炸；上下文越长模型越糊涂（*lost in the middle*）；迟早撞上窗口上限 |
+| **自己写个日志文件** | 数据留下了 | **存得下 ≠ 找得出**。1000 条日志里翻不出「主人不吃香菜」 |
+| **直接上向量数据库** | 语义检索很香 | 「主人」和「主人翁」向量很近，精确匹配垮掉；且为一句话装一整套服务 |
+| **上重型分层记忆方案** | 功能确实强 | 为了记住「主人爱喝龙井」，你先得部署 4 个 Docker 容器 |
 
-## 2. 架构与数据流
+### 具体到日常，是这四种翻车
+
+- 🐟 **重复自我介绍** —— 每换个会话就要重新交代一遍「我是谁、说话什么风格」；
+- 🙈 **推翻自己** —— 昨天说了「我讨厌香菜」，今天推荐菜还是「香菜拌牛肉」；
+- 💥 **记错铁律** —— 你三令五申「叫我主人」，某天它突然改口喊你「亲」；
+- 🚨 **串台事故** —— A 群的聊天内容，被 B 群的人问出来了。
+
+TierMem Core 就是为了把这四件事一次性解决。
+
+---
+
+<a id="pitch"></a>
+
+## 🎯 一句话定位
+
+> **tiermem-core 是一个极简、零容器、防幻觉的 Python Agent 分层记忆内核：**
+> **用「一个 SQLite 文件」管好「短期流水 → 中期事实 → 长期铁律」三层记忆，**
+> **检索时只把最该被记得的那几条，精准塞回 Prompt。**
+
+三个关键词，展开说：
+
+- **极简** —— 没有 Redis、没有 Milvus、没有 Neo4j。整个"数据库"就是一个 `.db` 文件，`cp` 一下就是备份。
+- **零容器** —— `pip` 装完就能跑，不需要 `docker-compose up`，不需要 Node.js，不需要运维。
+- **防幻觉** —— 记忆是**可追溯、可推翻、可置顶**的。它会告诉你"这条记忆从哪来"，也会在你说"我不喜欢了"之后优雅地废弃旧记忆，而不是把两条矛盾事实一起塞给模型让它自己精神分裂。
+
+---
+
+<a id="tiers"></a>
+
+## 🧠 三层记忆：人的大脑是怎么记账的
+
+先别管什么 L0~L3、什么 embedding 维度。**人的记忆本来就是分层的**，这个项目只是把大脑的做法搬进了代码。
+
+| 层级 | 🧠 大脑里的对应物 | 存什么 | 举例 | 特点 |
+| :-- | :-- | :-- | :-- | :-- |
+| **L1 工作记忆** | **桌边的草稿纸 / 流水账本** | 原始对话逐字全量保存 | 「周三 21:14 · 主人：今天加班好累」 | 量大、不做加工、**绝不会丢**（进门即落盘） |
+| **L2 情景记忆** | **随身笔记本** | 从流水里提炼出的**事实原子** | 「主人最近在赶一个项目，压力大」 | 精炼、带主题标签、带向量、可被推翻 |
+| **L3 核心记忆** | **刻在墙上的座右铭 / 铁律** | 必须长期遵守的偏好与硬约束 | 「称呼必须是"主人"」「严禁提及密码」 | 少量、**强力置顶**、**免死金牌** |
+
+### 记忆是怎么"升级"的
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│  用户说的一句话                                                  │
+│       │                                                         │
+│       ▼                                                         │
+│  ┌─────────┐   每轮实时落盘，断电不丢                            │
+│  │  L1 流水 │ ──────────────────────────────►  SQLite: l1_docs   │
+│  └────┬────┘                                                    │
+│       │  攒够 N 轮（默认 5 轮）→ 整窗打包成 1 次调用              │
+│       ▼                                                         │
+│  ┌──────────────┐   LLM 提炼出独立事实                          │
+│  │  事实抽取     │   + 廉价判官打分/查冲突                        │
+│  └──────┬───────┘                                               │
+│         ▼                                                       │
+│  ┌─────────┐   普通事实                                          │
+│  │  L2 原子 │ ──────────────────────────────►  SQLite: l2_atoms  │
+│  └────┬────┘                                                    │
+│       │  命中「喜欢/讨厌/必须/严禁/密码/习惯」                      │
+│       │  或重要度 ≥ 0.85                                        │
+│       ▼                                                         │
+│  ┌─────────┐                                                   │
+│  │  L3 铁律 │  pinned=1 · tier=3 ────────────►  SQLite: l2_atoms │
+│  └─────────┘  （检索时永远排在最前面，且不可能被覆盖）             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+> **为什么非要分层？**
+> 因为**检索时的优先级不一样**。L3 是「无论如何都得遵守」，L2 是「这条可能相关，看看」，L1 是「要溯源/要复述原话时才翻」。三层分开放，检索时才能各按各的权重处理；全塞一张大表里，就只能一刀切。
+
+### L3 是怎么自动晋升的
+
+命中以下关键词，或模型给出的重要度 ≥ `0.85`，就自动钉到墙上，**不需要你手动维护**：
 
 ```text
-                     ┌──────────────── AstrBot 对话链路 ────────────────┐
-                     │                                                  │
-   用户消息 ──► on_llm_request ──► [ 检索 + 注入 System Prompt ] ──► LLM ──► on_llm_response
-                     │            ▲                                        │
-                     │            │                                        ▼
-                     │     MemoryRetriever                       多轮缓冲池（内存）
-                     │            ▲                                        │ 满 N 轮打包
-                     │            │                                        ▼
-                     │     l2_atoms (L2 + L3)  ◄──── MemorySummarizer 后台 Worker
-                     │            ▲                                  │
-                     │            └──── l1_docs (L1 原始轮次)  ◄───────┤
-                     │                                               └──► task_dlq（失败死信）
-                     └──────────────────────────────────────────────────┘
+喜欢 · 讨厌 · 偏好 · 必须 · 严禁 · 密码 · 习惯
 ```
 
-### 模块划分
+命中即 `importance = 0.90`、`pinned = 1`、`tier = 3`。
 
-| 文件 | 职责 |
-| :-- | :-- |
-| `main.py` | Star 主类：配置规范化、五组件总装、生命周期托管、双向钩子、`/memory` 指令层 |
-| `storage.py` | SQLite 存储引擎：DDL、连接管理（WAL）、分层统计、`toggle_atom_pin()` 置顶切换 |
-| `summarizer.py` | 多轮缓冲池 + 异步 Worker：事实抽取（LLM / 规则回退）、**自作判定门禁接入**、向量去重融合、L3 晋升、DLQ 降级 |
-| `evaluator.py` | **自作判定门禁**：廉价判官模型（默认 `jev`）信息价值打分、事实冲突/推翻检测、超时与异常平滑降级 |
-| `retriever.py` | 两阶段混合检索：L3 置顶捞取、粗排召回、精排重排、Markdown 上下文组装 |
-| `models_client.py` | BGE-M3 向量客户端与 BGE-Reranker 客户端，含维度对齐校验与 RRF 降级 |
-| `migrator.py` | 旧版 `livingmemory` 资产无损迁移（dry-run / 备份快照 / 孤儿边跳过） |
-| `tests/` | Stage 1~5 全量测试套件（单元 + 端到端闭环 + 判定门禁） |
+也可以随时手动干预：
+
+```bash
+/memory pin 42     # 把第 42 条记忆钉上墙（或取消钉）
+/memory recall 龙井 # 手动试一下"关于龙井，它记得什么"
+/memory status     # 看一眼现在脑子里装了多少东西
+```
 
 ---
 
-## 3. 快速开始
+<a id="origin"></a>
 
-将插件目录放入 AstrBot 插件路径后，**最少只需 3 项配置**即可运行：
+## 🌱 源流与致敬：站在巨人的肩膀上
+
+这个项目不是凭空想出来的。它有两个明确的老师。
+
+### 老师一：腾讯开源的 `TencentDB-Agent-Memory`
+
+腾讯开源的 `TencentDB-Agent-Memory`（GitHub **30,000+ Star**）是目前业界做得最扎实的 Agent 记忆工程之一。我们从中**认真抄了两样真本事**：
+
+| 学到的精髓 | 为什么重要 |
+| :-- | :-- |
+| **L0~L3 分层记忆模型** | 记忆不是一堆平铺的向量，而是有层级的：原始记录 / 提炼事实 / 核心画像。分层决定了检索优先级、决定了什么能丢、什么不能丢。 |
+| **BM25 + 向量双路混合检索** | 两条腿走路：**BM25 保精确**（关键词、人名、专有名词一个都不能漏），**向量保语义**（"我不爱吃香菜"≈"香菜我不行"）。任何单路检索都会瘸腿。 |
+
+**没有这两位老师，这个项目不会存在。** 如果你要做的是超大规模、多租户、企业级的记忆中台，请直接用原版。
+
+### 但原版对我们来说太重了
+
+原版的定位是「工业级记忆基础设施」，代价是：
+
+```text
+4 个 Docker 容器 + Node.js 22 运行时 + 专用向量数据库 …… 镜像动辄数 GB
+```
+
+如果你只是想给自己的 QQ 机器人、Telegram Bot、或者一个本地小助手加个「记得住事」的能力，
+为了这个目标去维护一整套分布式记忆服务，**性价比是负的**。
+
+### 所以我们做了一次「极致轻量化降维重构」
+
+一句话概括：**留下架构精髓，扔掉部署负担。**
+
+| 维度 | 原版重型记忆系统 | 🟢 TierMem Core |
+| :-- | :-- | :-- |
+| **部署形态** | 4 个 Docker 容器 | **0 个容器**，一个 Python 进程 |
+| **运行时** | Node.js 22 | **Python 3.10+** |
+| **存储** | 专用向量数据库（独立服务、独立运维） | **单个 SQLite 文件**（WAL 模式，`cp` 即备份） |
+| **硬依赖** | 一整套服务栈 | **纯标准库**（`sqlite3` 内置）；`aiohttp` / `numpy` 均为**可选加速项**，缺失自动降级 |
+| **内存占用** | 数 GB 级 | **常驻约 30 MB** |
+| **上手成本** | 读半天部署文档 | **3 行配置**跑起来 |
+| **断网/无密钥** | 基本不可用 | **全降级链路**：规则抽取 + 关键词检索 + 本地 RRF 重排，照常工作 |
+| **检索能力** | BM25 + 向量 + 精排 | **向量 + 关键词双路粗排**，`BGE-Reranker` 精排；无密钥时降级本地 RRF 融合 |
+
+> 💡 **降维不是阉割。** 我们把「分布式服务」换成了「单文件数据库」，把「在线向量库」换成了「存成 BLOB 的向量 + 内存余弦计算」——对个人/小团队场景（万级记忆、单机部署），**效果没有肉眼可见的差别，运维成本趋近于零**。
+
+---
+
+<a id="plan-a"></a>
+
+## 🛡️ 生产级超越：方案 A 的五道硬核防线
+
+轻量化最容易死的姿势是「能跑，但一上线就翻车」。为此我们做了一轮**止血热修（方案 A）**，
+专门解决分层记忆系统在真实环境里的五个经典事故。
+
+每一条都不是"理论上应该"，而是**有专项测试锁死**的（`tests/test_stage6_hardening.py`，7 个用例，编号 R-01 ~ R-06）。
+
+### 🛡️ 1. L3 置顶免死金牌 —— 绝不因模型抽风误杀铁律
+
+**事故现场**：你设了「称呼必须是主人」。某天模型在判官环节抽风，或者用户开了句玩笑说「别叫我主人了」，
+于是这条核心设定的旧记录被标记为「已推翻」——**铁律当场蒸发**，机器人从此喊你「您好」。
+
+**我们的做法**：
+
+- 冲突检测的**规则层直接跳过** `pinned=1` 的候选，从源头不给它被推翻的机会；
+- 数据库层的软废弃 SQL 追加硬守卫 `AND COALESCE(pinned,0) = 0`，**双保险**；
+- 结论：`pinned=1` 的记忆**只能被手动 `unpin`**，任何自动流程都杀不掉它。
+
+```sql
+-- 软废弃时的硬守卫（R-01）
+UPDATE l2_atoms
+   SET status = 'superseded'
+ WHERE id = ? AND COALESCE(pinned, 0) = 0   -- ← 置顶记录在此被物理排除
+```
+
+### ⚡ 2. 真·多轮合并批处理 —— API 账单立省 80%
+
+**事故现场**：朴素实现是「每轮对话 → 1 次事实抽取 + 1 次门禁判定 + 1 次向量化」。
+5 轮对话就是 **15 次 API 调用**。这叫 **N+1 账单风暴**，跑一天就能给你账单干出心理阴影。
+
+**我们的做法**：把 N 轮**合并进同一个 Context Window**，一次做完：
+
+```text
+朴素实现（5 轮）：          本实现（5 轮）：
+  轮1 → LLM + 门禁 + Embed     ┌──────────────────────────┐
+  轮2 → LLM + 门禁 + Embed     │  5 轮打包成 1 个窗口      │
+  轮3 → LLM + 门禁 + Embed  →  │  ① 1 次事实抽取           │
+  轮4 → LLM + 门禁 + Embed     │  ② 1 次门禁判定           │
+  轮5 → LLM + 门禁 + Embed     │  ③ 1 次批量向量化         │
+  ─────────────────────       └──────────────────────────┘
+  合计 15 次调用                 合计 3 次调用 → 省 80%
+```
+
+**为什么质量不降反升**：模型看到的是一整段连贯对话，而不是 5 个被截断的碎片，**提炼事实的上下文更完整**。
+
+### 💾 3. L1 实时落盘 —— 断电、重启、崩溃，零丢失
+
+**事故现场**：为了"性能"，实现里往往先把对话攒在内存缓冲池，攒够 5 轮再写库。
+结果——**没攒够的 4 轮，在重启的那一刻全没了**。用户觉得这机器人有阿尔茨海默症。
+
+**我们的做法**：
+
+- `enqueue_dialogue()` **进门即写 L1**，不攒、不猜、不等；
+- L2 析出后回写 `l2_processed` 标记，避免重复提炼；
+- 额外加一个 **idle 超时刷盘**（默认 180s），长时间没人说话的会话尾巴也不会滞留内存。
+
+> 一句话：**提炼可以慢，落盘必须快。**
+
+### 🔒 4. 严格会话隔离 —— 杜绝隐私串台
+
+**事故现场**：A 群聊了体检报告，B 群的人随便问一句，记忆就被检索出来了。这是**事故级**的问题。
+
+**我们的做法**：
+
+- `strict_session_isolation` **默认开启**（默认值就是 `True`，不需要你记得去打开）；
+- 检索时只允许召回 **本会话** + `scope_key = 'global'`（显式标记为全局共享的）的记忆；
+- 跨群、跨私聊**物理隔离**，不是靠 Prompt 里写一句"请不要提及其他群的内容"来祈祷。
+
+### 🚀 5. 连接池复用 + 纯读检索 —— 告别 SQLite 事务打架
+
+**两个独立的性能坑，一起修掉：**
+
+| 坑 | 症状 | 修法 |
+| :-- | :-- | :-- |
+| **TLS 握手风暴** | 每次 Embedding/Rerank/判官调用都新建 `ClientSession`，高频下全是 TCP/TLS 握手开销 | 全程复用**持久 `aiohttp.ClientSession` 连接池**，`close()` 幂等释放 |
+| **SQLite 写锁争抢** | 检索时顺手更新"访问计数"，读操作变成写操作 → 和总结 Worker 抢写锁 → `database is locked` | 检索链路**纯读**，访问计数在内存累加、**异步定期刷盘**，`close()` 时兜底刷净 |
+
+> 结果：**检索零阻塞**，对话不会因为"正在记东西"而卡住。
+
+---
+
+<a id="quickstart"></a>
+
+## 🚀 30 秒快速上手
+
+### 1. 拿到代码
+
+```bash
+git clone https://github.com/Zyw052/tiermem-core.git
+cd tiermem-core
+```
+
+### 2. 零硬依赖，直接验证
+
+```bash
+# 不需要 pip install 任何东西就能跑完整个测试套件
+python3 tests/test_stage4_e2e.py
+```
+
+看到 `[闭环 OK] 冷重启持久化验证通过` 就说明：**记忆真的写进磁盘了，重启还在。**
+
+### 3. 可选：装上加速依赖
+
+```bash
+pip install aiohttp    # 仅在调用远程 Embedding / Rerank / LLM 时需要
+pip install numpy      # 可选，向量运算加速（缺失时自动回退纯 Python 实现）
+```
+
+### 4. 最小可用配置
+
+**只需要 3 行**，而且这三行全是默认值——也就是说，**什么都不配也能跑**：
 
 ```jsonc
 {
@@ -119,10 +330,13 @@ Query ──► ① L3 强力置顶捞取（pinned=1，按 importance 排序，�
 }
 ```
 
-此状态下未配置任何模型密钥，插件将走**全降级链路**：
-规则分句抽取事实 → 关键词（BM25 + 词重合）粗排 → 本地 RRF 精排 → 注入。
+此状态下走**全降级链路**（不需要任何模型密钥）：
 
-要实现完整语义能力，再补充向量与重排模型：
+```text
+规则分句抽取事实 → 关键词（BM25 + 词重合）粗排 → 本地 RRF 精排 → 注入 Prompt
+```
+
+### 5. 接上真正的模型（可选，但强烈建议）
 
 ```jsonc
 {
@@ -142,51 +356,140 @@ Query ──► ① L3 强力置顶捞取（pinned=1，按 importance 排序，�
 }
 ```
 
-> 也可填写 `summarizer.embedding_provider_id` / `summarizer.rerank_provider_id` / `summarizer.provider_id`，
-> 插件会尝试从 AstrBot 已配置的 Provider 中自动复用 `api_base` / `api_key` / `model`，无需重复填写密钥。
+### 6. 作为 AstrBot 插件使用
+
+把整个目录丢进 AstrBot 的插件路径，重启，开聊：
+
+```bash
+/AstrBot/data/plugins/astrbot_plugin_agent_memory/
+```
+
+然后试试管理指令：
+
+```bash
+/memory status                  # 看看脑子里装了什么
+/memory recall 咖啡             # 手动检索
+/memory pin 42                  # 把某条记忆钉成铁律
+/memory migrate                 # 从旧版 livingmemory 无损搬家
+```
 
 ---
 
-## 4. 三态注入配置指南（核心）
+<a id="compare"></a>
 
-记忆块写入位置直接决定模型对记忆的服从度。通过 `retrieval.inject_position` 三态路由：
+## 📊 架构对比：轻量到什么程度
 
-| 取值 | 写入目标 | 位置 | 推荐模型 | 适用场景 |
-| :-- | :-- | :-- | :-- | :-- |
-| **`system_head`**（默认） | `req.system_prompt` | 最前端（人格提示词之前） | Claude / GPT-4o | 记忆作为"最高优先级上下文"，指令权重最高 |
-| **`system_tail`** | `req.system_prompt` | 最末端（人格提示词之后） | 通用 | 人设优先、记忆作为补充参考，避免稀释人格 |
-| **`user_head`** | `req.prompt` | 用户 Query 最前端 | DeepSeek / Qwen | 对即时提问敏感的模型，记忆与当前问题紧邻 |
+### 存储与部署
 
-### 4.1 别名兼容
+| 维度 | 🐳 原生重型内存系统 | 🟢 TierMem Core |
+| :-- | :-- | :-- |
+| 容器数量 | 4+ | **0** |
+| 数据库 | 专用向量数据库（独立进程） | **1 个 SQLite 文件** |
+| 运行时 | Node.js 22 | **Python 3.10+** |
+| 磁盘占用 | 数 GB（镜像 + 模型） | **MB 级**（只有你的对话数据） |
+| 内存占用 | GB 级 | **~30 MB** |
+| 备份方式 | 快照 / 导出工具 | **`cp agent_memory.db backup.db`** |
+| 离线可用 | 否 | **是**（全降级链路） |
 
-配置值大小写、分隔符（`-` / 空格）均不敏感，并兼容以下同义写法：
+### 能力对比（和"常见做法"正面碰一碰）
 
-| 标准值 | 兼容别名 |
-| :-- | :-- |
-| `system_head` | `head`（Stage 2 旧值）、`system`、`system_prompt_head`、`prepend` |
-| `system_tail` | `tail`（Stage 2 旧值）、`system_prompt_tail`、`append` |
-| `user_head` | `prompt_head`、`user`、`query_head` |
+| 能力 | 全塞上下文 | 纯向量库 | 重型分层方案 | 🟢 **TierMem Core** |
+| :-- | :--: | :--: | :--: | :--: |
+| 长期记忆 | ⚠️ 撞窗口上限 | ✅ | ✅ | ✅ |
+| 精确匹配（人名/术语） | ⚠️ 靠模型运气 | ❌ 向量近义混淆 | ✅ BM25 | ✅ **BM25 + 词重合双路** |
+| 语义匹配 | ✅ | ✅ | ✅ | ✅ **向量余弦** |
+| 记忆冲突处理 | ❌ | ❌ | ⚠️ 部分 | ✅ **软废弃 + `superseded` 可追溯** |
+| 噪声过滤 | ❌ | ❌ | ⚠️ 部分 | ✅ **廉价判官前置门禁** |
+| 铁律不可被推翻 | ❌ | ❌ | ❌ | ✅ **L3 pinned 免死金牌** |
+| 会话隔离 | ⚠️ 要自己写 | ⚠️ 要自己写 | ⚠️ 要自己写 | ✅ **默认开启，物理隔离** |
+| 部署成本 | ✅ 零 | ⚠️ 要起服务 | ❌ 4 个容器起 | ✅ **零容器** |
+| 数据隐私 | ✅ 本地 | ⚠️ 看部署 | ⚠️ 看部署 | ✅ **单文件本地 SQLite** |
 
-非法 / 空值统一回退 `system_head`，**路由永不失效**。
+### 数据流全景
 
-### 4.2 注入相关配置
-
-```jsonc
-{
-  "memory_injection_enable": true,        // 注入总开关（可与沉淀独立关闭，只记忆不注入）
-  "retrieval": {
-    "inject_position": "system_head",     // 三态路由
-    "prompt_injection_max_chars": 2000,   // 记忆块字符上限，0 = 不限制
-    "retrieve_timeout": 3.0,              // 检索超时(秒)，超时静默放弃本次注入
-    "top_k": 6                            // 单次注入的记忆条数上限
-  }
-}
+```text
+                     ┌──────────────── 对话链路 ────────────────┐
+                     │                                          │
+   用户消息 ──► on_llm_request ──► [ 检索 + 注入 Prompt ] ──► LLM ──► on_llm_response
+                     │            ▲                                    │
+                     │            │                                    ▼
+                     │     MemoryRetriever                    多轮缓冲池（内存）
+                     │      ① L3 置顶捞取                              │ 满 N 轮打包
+                     │      ② 向量 + 关键词双路粗排                    ▼
+                     │      ③ Cross-Encoder 精排              MemorySummarizer
+                     │      ④ 组装 Markdown 记忆块                  │  ├─ 事实抽取
+                     │            ▲                                │  ├─ 判官门禁
+                     │            │                                │  ├─ 批量向量化
+                     │     l2_atoms (L2 + L3)  ◄───────────────────┤  └─ L3 晋升
+                     │            ▲                                │
+                     │            └── l1_docs (L1 实时落盘)  ◄─────┤
+                     │                                             └─► task_dlq（失败死信）
+                     └────────────────────────────────────────────────────┘
 ```
 
-> **调优建议**：若发现人格被记忆稀释，改用 `system_tail`；若发现模型忽略记忆，改用 `system_head`；
-> 若记忆内容过长挤占上下文，下调 `prompt_injection_max_chars`。
+### 模块地图
 
-### 4.3 注入效果示例
+| 文件 | 一句话职责 |
+| :-- | :-- |
+| `main.py` | 主类装配：配置规范化、组件总装、生命周期托管、双向钩子、`/memory` 指令层 |
+| `storage.py` | SQLite 引擎：DDL、WAL 连接管理、分层统计、`toggle_atom_pin()` 置顶切换 |
+| `summarizer.py` | 多轮缓冲池 + 异步 Worker：事实抽取、门禁接入、向量去重融合、L3 晋升、DLQ 降级 |
+| `evaluator.py` | **判官门禁**：信息价值打分、事实冲突/推翻检测、超时与异常平滑降级 |
+| `retriever.py` | 两阶段混合检索：L3 置顶、粗排召回、精排重排、Markdown 上下文组装 |
+| `models_client.py` | BGE-M3 向量客户端 & BGE-Reranker 客户端，含维度对齐校验与 RRF 降级 |
+| `migrator.py` | 旧版 `livingmemory` 资产无损迁移（dry-run / 备份快照 / 孤儿边跳过） |
+| `tests/` | Stage 1~6 全量测试套件 |
+
+---
+
+<a id="config"></a>
+
+## ⚙️ 配置说明
+
+### 兼容各大模型：只要 OpenAI 兼容协议
+
+`api_base` + `api_key` + `model` 三件套，**任何 OpenAI 兼容端点都能接**：
+
+| 场景 | 推荐配置 |
+| :-- | :-- |
+| **硅基流动**（性价比首选） | `api_base: https://api.siliconflow.cn/v1` · `model: BAAI/bge-m3` |
+| **DeepSeek / Qwen**（总结用） | 填官方兼容端点，`model: deepseek-chat` / `qwen-plus` |
+| **OpenAI** | `api_base: https://api.openai.com/v1` · `model: text-embedding-3-small` |
+| **本地 Embedding**（Ollama / Xinference / vLLM） | `api_base: http://127.0.0.1:11434/v1` · `model: bge-m3` · `api_key` 随便填 |
+| **本地判官模型** | `evaluator.model_name` 指向本地小模型（默认 `jev`），成本几乎为零 |
+| **完全离线** | 什么都不配 → 自动走规则抽取 + 关键词检索 + 本地 RRF |
+
+> 若你的宿主（如 AstrBot）已经配置过 Provider，可直接填 `summarizer.provider_id` /
+> `summarizer.embedding_provider_id` / `summarizer.rerank_provider_id`，
+> 插件会自动复用其中的 `api_base` / `api_key` / `model`，**不用重复填密钥**。
+
+### 三态注入：记忆塞在哪里，决定模型听不听话
+
+| 取值 | 写入位置 | 推荐模型 | 适用场景 |
+| :-- | :-- | :-- | :-- |
+| **`system_head`**（默认） | System Prompt **最前端** | Claude / GPT-4o | 记忆即最高优先级上下文，**指令权重最高** |
+| **`system_tail`** | System Prompt **最末端** | 通用 | 人设优先，记忆作为补充，避免稀释人格 |
+| **`user_head`** | 用户 Query **最前端** | DeepSeek / Qwen | 对即时提问敏感的模型，记忆与问题紧邻 |
+
+> **调优口诀**：人格被记忆稀释 → 改 `system_tail`；模型忽略记忆 → 改 `system_head`；上下文被挤爆 → 下调 `prompt_injection_max_chars`。
+
+### 关键参数速查
+
+| 配置项 | 默认值 | 说明 |
+| :-- | :-- | :-- |
+| `enable_memory` | `true` | 记忆总开关 |
+| `db_path` | `''` | 留空 → 插件数据目录；填目录 → 目录下 `agent_memory.db`；填文件 → 直接用 |
+| `summary_turn_interval` | `5` | 多轮缓冲打包阈值（**这个值直接决定 API 账单**） |
+| `summary_idle_flush_seconds` | `180` | 静默超时自动刷盘（0 关闭） |
+| `retrieval.top_k` | `6` | 单次注入的记忆条数上限 |
+| `retrieval.prompt_injection_max_chars` | `2000` | 记忆块字符上限，0 = 不限制 |
+| `retrieval.retrieve_timeout` | `3.0` | 检索超时（秒），超时静默放弃本次注入 |
+| `retrieval.strict_session_isolation` | `true` | **严格会话隔离**，仅本会话 + `global` 可召回 |
+| `evaluator.enable` | `true` | 是否启用入库前判官门禁 |
+| `evaluator.min_value_score` | `0.35` | 信息价值过滤阈值，低于即丢弃 |
+| `evaluator.fail_open` | `true` | 判官挂掉时是否保留事实（**宁多记，不丢记忆**） |
+
+### 注入效果长什么样
 
 ```markdown
 <!-- agent_memory:injected:v1 -->
@@ -198,123 +501,26 @@ Query ──► ① L3 强力置顶捞取（pinned=1，按 importance 排序，�
 - 上周我们讨论了西湖龙井的采摘季节。 *(相关度: 0.7341)*
 ```
 
----
-
-## 5. 管理指令清单
-
-指令组 `/memory`，子指令如下（宿主不支持指令组时自动降级为扁平 `/memory_status` 等）：
-
-| 指令 | 参数 | 功能 | 输出要点 |
-| :-- | :-- | :-- | :-- |
-| `/memory status` | — | 查看运行状态快照 | L1/L2/L3 体量、待总结轮次与会话数、注入策略、模型健康度、双向钩子统计 |
-| `/memory recall <关键词>` | 检索词 | 手动执行两阶段检索 | L3 置顶列表（ID/类型/重要度）+ L2 精排列表（`score=` / ID / 内容） |
-| `/memory pin <atom_id>` | 原子 ID | 切换 L3 置顶状态 | `pinned=1,tier=3` 与 `pinned=0,tier=2` 可逆切换，回显内容与当前状态 |
-| `/memory migrate` | — | 迁移旧版 `livingmemory` 资产 | 源库路径、dry-run/正式模式、L1/L2/图谱迁移计数、备份快照路径、耗时 |
-
-### 输出示例：`/memory status`
-
-```markdown
-## 🧠 分层记忆状态
-- **体量**: L1 历史 `7` 条 · L1 待总结 `0` 轮（0 会话） · L2 原子 `7` 条 · L3 置顶 `3` 条 · 图谱 `0` 节点 / `0` 关系
-- **策略**: 注入位置 `system_head`（System Prompt 最前端（推荐：Claude / GPT-4o）） · 总结阈值 `5` 轮/批 · 记忆总开关 `开启` · 注入开关 `开启`
-- **模型**: Embedding ✅ 可用（BAAI/bge-m3） · Rerank ✅ 可用（BAAI/bge-reranker-v2-m3）
-- **钩子**: 注入 成功 `1` / 跳过 `0` / 降级 `0` · 记录 成功 `5` / 跳过 `0` / 降级 `0`
-```
-
-> 未配置密钥时，模型行显示 `⚠️ 未配置密钥（零向量降级）` / `⚠️ 未配置密钥（本地 RRF 降级）`，便于快速定位降级原因。
+> 隐藏标记 `<!-- agent_memory:injected:v1 -->` 保证**同一请求绝不重复注入**（包括工具调用的多轮往返）。
 
 ---
 
-## 6. 配置项速查
+<a id="tests"></a>
 
-### 记忆与生命周期
+## 🧪 测试与质量保障
 
-| 配置项 | 类型 | 默认 | 说明 |
-| :-- | :-- | :-- | :-- |
-| `enable_memory` | bool | `true` | 分层记忆总开关（关闭则不启 Worker、不记录、不注入） |
-| `db_path` | string | `''` | 记忆数据库路径。留空→插件数据目录；填目录→目录下 `agent_memory.db`；填文件→直接使用 |
-| `summary_turn_interval` | int | `5` | 多轮缓冲打包阈值（轮） |
-| `summary_idle_flush_seconds` | int | `180` | 会话静默超时自动刷盘（0 关闭），防止尾部轮次长期滞留内存 |
-| `summarizer_queue_maxsize` | int | `1000` | 后台消费队列容量，满则降级写 DLQ |
-| `memory_injection_enable` | bool | `true` | 注入开关，独立于总开关 |
-
-### 总结模型（`summarizer.*`）
-
-| 配置项 | 默认 | 说明 |
-| :-- | :-- | :-- |
-| `provider_id` | `''` | 复用 AstrBot Provider 的 LLM 凭证 |
-| `embedding_provider_id` / `rerank_provider_id` | `''` | 复用 Provider 的向量/重排凭证 |
-| `api_base` / `api_key` / `model` | `''` | OpenAI 兼容总结端点；缺失则走规则抽取回退 |
-| `timeout_seconds` | `45` | 总结请求超时 |
-| `max_concurrency` | `2` | 后台总结最大并发 |
-
-### 自作判定门禁（`evaluator.*`）
-
-| 配置项 | 默认 | 说明 |
-| :-- | :-- | :-- |
-| `enable` | `true` | 是否启用入库前预判定（关闭则原样入库） |
-| `model_name` | `jev` | **判官模型名称**；留空回退 `summarizer.model` |
-| `api_base` / `api_key` | `''` | 判官端点；留空自动复用 `summarizer.api_base` / `api_key` |
-| `timeout_seconds` | `8.0` | 判官请求超时，超时即降级为规则判定 |
-| `min_value_score` | `0.35` | 信息价值过滤阈值（低于即丢弃） |
-| `fallback_min_value_score` | `0.175` | 降级路径的放宽阈值，避免误伤有效记忆 |
-| `conflict_check` | `true` | 启用事实冲突与推翻检测 |
-| `conflict_similarity` | `0.5` | 冲突判定的字符二元组相似度下限 |
-| `max_candidates` | `8` | 单次判官比对的历史事实上限 |
-| `fail_open` | `true` | 判官失败时是否保留事实 |
-
-### 模型（`models.*`）与检索（`retrieval.*`）
-
-| 配置项 | 默认 | 说明 |
-| :-- | :-- | :-- |
-| `embedding.api_base` / `model` / `dim` | SiliconFlow / `BAAI/bge-m3` / `1024` | 向量模型，维度自动截断/补零对齐 |
-| `rerank.api_base` / `model` | SiliconFlow / `BAAI/bge-reranker-v2-m3` | 重排模型，无密钥则本地 RRF |
-| `rerank.rrf_k` | `60` | RRF 融合常数 |
-| `retrieval.top_k` | `6` | 单次召回/注入条数 |
-| `retrieval.inject_position` | `system_head` | **三态注入路由** |
-| `retrieval.prompt_injection_max_chars` | `2000` | 注入字符上限 |
-| `retrieval.retrieve_timeout` | `3.0` | 前置检索超时（超时即放弃注入） |
-| `retrieval.record_dedup_window` | `2.0` | 轮次记录去重时间窗（秒） |
-| `retrieval.strict_session_isolation` | `true` | **严格会话隔离**：仅本会话 + `scope_key='global'` 可召回，物理杜绝串台 |
-| `retrieval.access_flush_interval` | `60.0` | 访问计数异步刷盘间隔（秒），检索链路保持纯读 |
-| `retrieval.access_flush_threshold` | `200` | 访问计数累计达到该条数立即异步刷盘 |
-
-### 迁移（`migration.*`）
-
-| 配置项 | 默认 | 说明 |
-| :-- | :-- | :-- |
-| `auto_detect_legacy` | `true` | 启动时自动检测旧插件数据目录 |
-| `source_db_path` | `''` | 旧版 `livingmemory.db` 路径（留空自动探测） |
-| `force` | `false` | 目标库非空仍强制迁移 |
-| `dry_run` | `false` | 仅预览统计，不写入 |
-
----
-
-## 7. 测试与质量保障
-
-四套件分层递进，全部可脱离 AstrBot 宿主独立运行（内置宿主桩包，零外部依赖）：
+**6 个套件 · 41 个用例 · 全部可脱离宿主独立运行**（内置宿主桩包，零外部依赖）。
 
 ```bash
-python3 tests/test_stage1_buffer.py      # 多轮缓冲打包 / 强制冲洗 / Worker 消费
-python3 tests/test_stage2_hooks.py       # 双向钩子装配 / 注入 / 记录 / 降级 / 格式化
-python3 tests/test_stage3_commands.py    # 三态注入路由 / 四指令 / 指令组装配
-python3 tests/test_stage4_e2e.py         # 全链路端到端闭环 + 冷重启持久化
-python3 tests/test_stage5_evaluator_gate.py  # 判定门禁：价值打分 / 冲突废弃 / 超时降级
-python3 tests/test_stage6_hardening.py   # 方案A 止血热修：R-01 ~ R-06 六项专项
+python3 tests/test_stage1_buffer.py          # 多轮缓冲打包 / 强制冲洗 / Worker 消费
+python3 tests/test_stage2_hooks.py           # 双向钩子装配 / 注入 / 记录 / 降级 / 格式化
+python3 tests/test_stage3_commands.py        # 三态注入路由 / 四指令 / 指令组装配
+python3 tests/test_stage4_e2e.py             # 全链路端到端闭环 + 冷重启持久化
+python3 tests/test_stage5_evaluator_gate.py  # 判官门禁：价值打分 / 冲突废弃 / 超时降级
+python3 tests/test_stage6_hardening.py       # 方案 A 防线：R-01 ~ R-06 六项专项
 ```
 
-### 覆盖矩阵
-
-| 套件 | 验证重点 |
-| :-- | :-- |
-| **Stage 1** | 前 N-1 轮留在缓冲、第 N 轮打包 `kind=batch`、`flush_all` 多会话冲洗、空会话返回 0、Worker 消费后 L2 落库 |
-| **Stage 2** | 钩子装饰器注册、记忆块前置注入且人设保留、注入幂等、分片/工具轮过滤、重复回调去重、检索异常/超时/缺失全降级、`format_memory_block` 优先/兜底/截断 |
-| **Stage 3** | `system_head`/`system_tail`/`user_head` 三态路由与别名归一化、`cmd_status`/`cmd_recall`/`cmd_pin`/`cmd_migrate` 输出与边界零异常、指令组装配 |
-| **Stage 4** | ① Worker 启动 → ② 5 轮真实钩子触发 batch → ③ L1 落库 + L2 沉淀 + L3 晋升（DLQ=0）→ ④ 两阶段检索注入 L3+L2 → ⑤ 三指令真实读写联动（`pin` 可逆切换并用 `status` 交叉验证）→ ⑥ `terminate()` 尾部冲洗/Worker 回收/连接关闭/数据无损；外加**冷重启复用同一库仍可召回** |
-| **Stage 5** | 判官默认模型 `jev` 与凭证回退、寒暄/纯提问过滤、否定极性翻转与推翻标记识别、判官成功路径（阈值过滤 + 非法 `conflict_id` 过滤）、非法 JSON/连接异常/超时三种降级、`enable=false` 放行、端到端“判官不可用仍入库”、端到端“旧事实软废弃且检索不召回”、融合场景不自我废弃 |
-| **Stage 6** | **R-01** 置顶免死（规则层豁免 + SQL 守卫 + 端到端不废弃）、**R-02** L1 实时落盘/`l2_processed` 回写/idle 超时刷盘、**R-03** 5 轮仅 1 次 LLM+1 次门禁+1 次批量 Embedding、**R-04** 默认严格隔离（跨会话不可见、`global` 例外）、**R-05** 检索不写库/异步刷盘/`close()` 刷净、**R-06** Session 复用与幂等 `close()` |
-
-### Stage 4 实测闭环指标
+### 实测闭环输出（Stage 4）
 
 ```text
 [① OK] 插件初始化完成 | turn_interval=5 | worker=agent_memory_summarizer_worker
@@ -329,42 +535,177 @@ python3 tests/test_stage6_hardening.py   # 方案A 止血热修：R-01 ~ R-06 �
 [闭环 OK] 二次停机后资源同样完全释放
 ```
 
----
+### 设计原则：永不阻断主链路
 
-## 8. 版本演进
+```text
+任何记忆操作出错（超时 / 报错 / 返回非法 JSON / 模型不可用）
+        ↓
+静默降级，绝不影响正常对话
+```
 
-| 阶段 | 提交主题 | 交付内容 |
-| :-- | :-- | :-- |
-| **Stage 1** | `feat(stage1)` | 多轮窗口缓冲打包、异步 Worker 骨架、插件生命周期托管（`initialize` / `terminate`） |
-| **Stage 2** | `feat(stage2)` | 双向 LLM 钩子装配（注入 + 记录）、静默降级与幂等保护 |
-| **Stage 3** | `feat(stage3)` | 三态动态注入路由、完整 `/memory` 管理指令组（status / recall / pin / migrate） |
-| **Stage 4** | `feat(stage4)` | 全链路端到端集成测试、README 文档收口、首个可发布版本 |
-| **Stage 5** | `feat(stage5)` | 自作判定门禁：廉价判官 `jev`、价值打分、冲突软废弃与平滑降级 |
-| **方案 A** | `fix(hardening)` | 止血热修 R-01 ~ R-06：置顶免死、真批量合并、L1 实时落盘、默认严格隔离、连接池复用、检索纯读 |
-
----
-
-## 9. 数据安全与隐私
-
-- 全部记忆数据存储于**本地 SQLite**，不上传任何第三方（模型 API 仅发送待提炼的对话文本）；
-- 连接启用 `WAL` + `synchronous=NORMAL`，读写并发安全；
-- 关闭流程保证 `flush → drain → close` 顺序，**正常停机不丢记忆**；
-- 迁移前自动生成安全快照，`dry_run` 可先预览统计再决定是否落库。
+- 检索超时（默认 3s）→ 放弃本次注入，正常聊天；
+- 判官挂掉 → 回退本地规则判定，`fail_open=true` 默认保留事实；
+- 向量服务不可用 → 降级为关键词检索 + 本地 RRF 融合；
+- 后台处理异常 → 写入 `task_dlq` 死信队列，单条失败不阻断整批。
 
 ---
 
-## 10. 已知边界
+<a id="roadmap"></a>
 
-以下能力已完成表结构 / 配置项预留，运行期链路将在后续版本接入，**当前不影响 L1/L2/L3 主链路**：
+## 🗺️ 开源演进路线图
+
+### ✅ 已完成
+
+| 阶段 | 主题 | 交付 |
+| :--: | :-- | :-- |
+| **Stage 1** | 多轮窗口缓冲 | 窗口打包、异步 Worker、生命周期托管 |
+| **Stage 2** | 双向 LLM 钩子 | 注入 + 记录、静默降级、注入幂等 |
+| **Stage 3** | 三态注入 + 指令层 | `system_head/tail` + `user_head`、`/memory` 四指令 |
+| **Stage 4** | 端到端集成 | 全链路闭环测试、冷重启持久化 |
+| **Stage 5** | 判官门禁 | 廉价判官 `jev`、价值打分、冲突软废弃 |
+| **方案 A** | 生产级加固 | R-01 ~ R-06：置顶免死、真批量、实时落盘、严格隔离、连接池、纯读检索 |
+
+### 🚧 方案 B：原生 SQLite FTS5 引擎（下一步）
+
+**要解决的问题**：当前关键词检索是自己手写的「字词重合 + BM25 近似」。够用，但不够快也不够规范的。
+
+**要做成什么样**：
+
+```sql
+-- 目标：让 SQLite 自己干 BM25 的活
+CREATE VIRTUAL TABLE l2_fts USING fts5(
+    content, topics,
+    tokenize = 'unicode61'     -- 中文再叠加自定义分词
+);
+```
+
+- **零依赖 BM25**：用 SQLite 内置的 FTS5 虚拟表做真正的 BM25 排序，不再依赖手写打分；
+- **中文分词管道**：`jieba` 可选接入，缺失时回退字符二元组（bigram），保证中文也能命中；
+- **子串兜底召回**：FTS5 对短查询可能漏召，叠加 `LIKE '%kw%'` 兜底，防止"两字关键词查不到"；
+- **彻底摆脱 numpy**：向量走 BLOB + 可选 numpy；FTS5 路径完全不需要向量依赖。
+
+> **预期收益**：召回准确率提升、检索延迟下降，且**仍然是零容器、单文件**。
+
+### 🔮 方案 C：真·时序知识图谱（再下一步）
+
+**要解决的问题**：现在的记忆是「一堆独立事实原子」，缺少**事实之间的关系**和**时间维度**。
+这两样东西缺失，就答不了这类问题：
+
+- 「主人和小李是什么关系？」
+- 「主人上个月喜欢喝美式，这个月改喜欢龙井了——哪个是现在的？」
+
+**基础设施已经预留好了**（`kg_nodes` / `kg_edges` 表结构已建，运行期待接线）：
+
+```text
+                    ┌──────────────┐
+                    │   主人 (人)   │
+                    └──────┬───────┘
+              ┌────────────┼────────────┐
+              │ 喜欢(2026-09)│            │ 认识(2025-03)
+              ▼            ▼            ▼
+        ┌─────────┐  ┌─────────┐  ┌─────────┐
+        │  美式    │  │  龙井    │  │  小李    │
+        └─────────┘  └─────────┘  └─────────┘
+          ↑ 已过期      ↑ 当前有效
+```
+
+- **时序边（temporal edges）**：每条关系带 `valid_from` / `valid_to`，不再需要把旧事实删掉；
+- **冲突自动收敛**：「美式」的边被标记 `valid_to = now`，检索时只返回"当前有效"的事实；
+- **多跳推理**：支持「主人 → 同事 → 小李」这类 1~2 跳查询，回答"关系型"问题；
+- **时间旅行查询**：能回答「三个月前主人喜欢喝什么」。
+
+### 🎯 其他待办
+
+- [ ] 专属 WebUI 面板（配置项已预留）
+- [ ] 检索权重细粒度可调（当前为内置 `0.55` 向量 + `0.45` 关键词）
+- [ ] 记忆遗忘曲线 / 时间衰减（让久不用的记忆自动降权）
+- [ ] 记忆导出 / 导入（JSON / Markdown）
+- [ ] 更多宿主适配器（不限于 AstrBot）
+
+---
+
+<a id="privacy"></a>
+
+## 🔒 数据安全与隐私
+
+- **数据全在本地**：所有记忆存在你自己机器上的一个 SQLite 文件里，**不上传任何第三方**；
+- **只发必要内容**：调用模型 API 时，仅发送待提炼的对话文本，不发送数据库、不发送其他会话内容；
+- **物理隔离**：`strict_session_isolation` 默认开启，跨群/跨私聊记忆不互通；
+- **可追溯**：被推翻的旧事实标记为 `superseded` 而非物理删除，可查"这条记忆是什么时候、被什么替代的"；
+- **可备份**：`cp agent_memory.db backup.db`，一个文件搞定备份与迁移；
+- **安全停机**：关闭流程严格保证 `flush → drain → close` 顺序，正常停机不丢记忆。
+
+---
+
+<a id="faq"></a>
+
+## ❓ FAQ
+
+<details>
+<summary><b>数据量大了会不会慢？</b></summary>
+
+SQLite 在万级记忆规模、带索引的情况下，检索是毫秒级的。真到十万级以上，方案 B 的 FTS5 + 方案 C 的图谱会接上。如果你的规模真到了企业级，建议直接用腾讯原版。
+</details>
+
+<details>
+<summary><b>一个模型密钥都不配，能用吗？</b></summary>
+
+能。走全降级链路：规则分句抽取事实 → 关键词（BM25 + 词重合）粗排 → 本地 RRF 融合排序 → 注入。效果不如配了向量模型，但**完全可用**。
+</details>
+
+<details>
+<summary><b>为什么不用 aiosqlite / SQLAlchemy？</b></summary>
+
+为了守住"零硬依赖"。`sqlite3` 是标准库，配合 WAL 模式 + 独立连接 + 纯读检索，已经能满足单机并发需求。少一个依赖，少一类线上问题。
+</details>
+
+<details>
+<summary><b>方案 A 的"省 80% 账单"是怎么算的？</b></summary>
+
+朴素实现每轮 3 次调用（抽取 + 门禁 + 向量化），5 轮共 15 次。合并批处理后 5 轮只需 3 次（1 抽取 + 1 门禁 + 1 批量向量化）。`(15-3)/15 = 80%`。
+</details>
+
+<details>
+<summary><b>能用在非 AstrBot 的项目里吗？</b></summary>
+
+核心逻辑（`storage.py` / `summarizer.py` / `retriever.py` / `evaluator.py` / `models_client.py`）都是纯 Python，**只依赖标准库 + 可选 aiohttp**，可以抽出来嵌入任何 Python Agent 框架。当前首发形态是 AstrBot 插件，宿主适配器在路线图里。
+</details>
+
+<details>
+<summary><b>和腾讯原版是什么关系？</b></summary>
+
+**致敬与借鉴，非分支、非官方。** 我们吸收了它的 L0~L3 分层模型与双路混合检索思想，用纯 Python + SQLite 重新实现了一个轻量版。做企业级记忆中台请用原版；做个人/小团队 Agent，用这个。
+</details>
+
+---
+
+<a id="boundary"></a>
+
+## 🚧 已知边界
+
+以下能力**表结构 / 配置项已就绪，运行期链路待接入**，当前不影响 L1/L2/L3 主链路：
 
 | 能力 | 当前状态 |
 | :-- | :-- |
-| 知识图谱运行期写入（`kg_nodes` / `kg_edges`） | 表结构与迁移映射已就绪；运行期图谱自动构建待接入（`/memory status` 中图谱计数仅在迁移后非零） |
-| 专属 WebUI 面板（`webui.*`） | 配置项已预留；HTTP 面板实现待提供 |
-| 检索权重细粒度调节（`retrieval.weight_*`） | 配置项已预留；当前粗排融合为内置 `0.55` 向量 + `0.45` 关键词 |
+| 知识图谱运行期写入（`kg_nodes` / `kg_edges`） | 表结构与迁移映射已就绪，自动构建待方案 C 接入 |
+| 专属 WebUI 面板（`webui.*`） | 配置项已预留，HTTP 面板待实现 |
+| 检索权重细粒度调节（`retrieval.weight_*`） | 配置项已预留，当前为内置 `0.55` 向量 + `0.45` 关键词 |
+| 原生 FTS5 关键词引擎 | 待方案 B 接入（当前为手写 BM25 近似） |
 
 ---
 
-## 11. 许可
+<a id="license"></a>
 
-随 AstrBot 生态发布。
+## 📄 License
+
+[MIT](LICENSE) © 2026 Zyw052
+
+---
+
+<div align="center">
+
+**如果这个项目帮到了你，点个 ⭐ Star 就是最好的支持。**
+
+*记忆不该是奢侈品，它应该是每个 Agent 的出厂配置。*
+
+</div>
