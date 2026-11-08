@@ -162,6 +162,136 @@ class MemoryStorage:
             logger.error("Failed to query table counts: %s", exc, exc_info=True)
         return counts
 
+    def get_tier_stats(self) -> Dict[str, int]:
+        """
+        统计分层记忆体量，供 /memory status 指令与 WebUI 概览使用。
+
+        返回键值：
+        - l1_docs   : L1 工作区/历史文档条数
+        - l2_atoms  : L2 情景记忆原子条数
+        - l2_pinned : L3 置顶原子条数（pinned=1 或 tier>=3）
+        - kg_nodes  : 知识图谱实体节点数
+        - kg_edges  : 知识图谱关系边数
+        - task_dlq  : 异步任务死信队列条数
+
+        说明：l2_atoms 的 pinned/tier 为检索器按需补齐的扩展列，
+        在尚未补齐时会自动降级为 0，且任何异常都不外抛（状态指令要求零崩溃）。
+        """
+        stats: Dict[str, int] = {
+            "l1_docs": 0,
+            "l2_atoms": 0,
+            "l2_pinned": 0,
+            "kg_nodes": 0,
+            "kg_edges": 0,
+            "task_dlq": 0,
+        }
+        try:
+            conn = self.connect()
+        except Exception as exc:
+            logger.error("get_tier_stats 连接失败: %s", exc, exc_info=True)
+            return stats
+
+        # 1. 各基础表行数（逐表容错，避免单表缺失导致整体失败）
+        for table in ("l1_docs", "l2_atoms", "kg_nodes", "kg_edges", "task_dlq"):
+            try:
+                row = conn.execute(f"SELECT COUNT(1) AS cnt FROM {table}").fetchone()
+                stats[table] = int(row["cnt"]) if row is not None else 0
+            except Exception as exc:
+                logger.debug("统计表 %s 失败（忽略）: %s", table, exc)
+                stats[table] = 0
+
+        # 2. L3 置顶计数：仅在扩展列存在时可统计
+        try:
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(l2_atoms)").fetchall()}
+            if "pinned" in cols and "tier" in cols:
+                row = conn.execute(
+                    "SELECT COUNT(1) AS cnt FROM l2_atoms WHERE pinned = 1 OR tier >= 3"
+                ).fetchone()
+                stats["l2_pinned"] = int(row["cnt"]) if row is not None else 0
+            elif "pinned" in cols:
+                row = conn.execute(
+                    "SELECT COUNT(1) AS cnt FROM l2_atoms WHERE pinned = 1"
+                ).fetchone()
+                stats["l2_pinned"] = int(row["cnt"]) if row is not None else 0
+        except Exception as exc:
+            logger.debug("统计 L3 置顶数失败（忽略）: %s", exc)
+            stats["l2_pinned"] = 0
+
+        return stats
+
+    def toggle_atom_pin(self, atom_id: str) -> Dict[str, Any]:
+        """
+        按 atom_id 切换 L2 原子的置顶状态（pinned/tier 同步联动）。
+
+        行为：
+        - 当前未置顶 → 置顶（pinned=1, tier=3），即 L3 晋升；
+        - 当前已置顶 → 取消（pinned=0, tier=2），即 L3 降级；
+        - 记录不存在 / 参数非法 → found=False，不抛异常。
+
+        返回字典：
+        {"found": bool, "atom_id": str, "content": str,
+         "was_pinned": bool, "is_pinned": bool, "error": str}
+        """
+        result: Dict[str, Any] = {
+            "found": False,
+            "atom_id": str(atom_id or "").strip(),
+            "content": "",
+            "was_pinned": False,
+            "is_pinned": False,
+            "error": "",
+        }
+        aid = result["atom_id"]
+        if not aid:
+            result["error"] = "atom_id 为空"
+            return result
+
+        try:
+            conn = self.connect()
+
+            # 幂等补齐扩展列（旧库可能尚未经过 retriever 迁移）
+            cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(l2_atoms)").fetchall()}
+            with conn:
+                if "pinned" not in cols:
+                    conn.execute(
+                        "ALTER TABLE l2_atoms ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;"
+                    )
+                if "tier" not in cols:
+                    conn.execute(
+                        "ALTER TABLE l2_atoms ADD COLUMN tier INTEGER NOT NULL DEFAULT 2;"
+                    )
+
+            row = conn.execute(
+                "SELECT atom_id, content, pinned, tier FROM l2_atoms WHERE atom_id = ?",
+                (aid,),
+            ).fetchone()
+            if row is None:
+                result["error"] = "记录不存在"
+                return result
+
+            was_pinned = bool(int(row["pinned"] or 0)) or int(row["tier"] or 2) >= 3
+            new_pinned = 0 if was_pinned else 1
+            new_tier = 2 if was_pinned else 3
+
+            with conn:
+                conn.execute(
+                    "UPDATE l2_atoms SET pinned = ?, tier = ?, updated_at = ? WHERE atom_id = ?",
+                    (new_pinned, new_tier, time.time(), aid),
+                )
+
+            result.update(
+                {
+                    "found": True,
+                    "content": str(row["content"] or ""),
+                    "was_pinned": was_pinned,
+                    "is_pinned": bool(new_pinned),
+                }
+            )
+        except Exception as exc:
+            logger.error("toggle_atom_pin 失败 (atom_id=%s): %s", aid, exc, exc_info=True)
+            result["error"] = str(exc)
+
+        return result
+
     def close(self) -> None:
         """安全关闭数据库连接"""
         if self._conn is not None:

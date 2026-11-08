@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # AstrBot 框架导入（logger 提供兜底，便于脱离宿主做静态检查与单测）
@@ -55,6 +57,14 @@ _ON_LLM_RESPONSE = (
 _ON_DECORATING_RESULT = (
     getattr(event_filter, "on_decorating_result", None) if event_filter is not None else None
 )
+
+# Stage 3：管理指令装饰器能力探测
+# - command_group : 指令组（@filter.command_group("memory") → group.command("status")）
+# - command       : 扁平指令（无指令组能力时的降级装配路径）
+_COMMAND_GROUP = (
+    getattr(event_filter, "command_group", None) if event_filter is not None else None
+)
+_COMMAND = getattr(event_filter, "command", None) if event_filter is not None else None
 
 # ---------------------------------------------------------------------------
 # 本地模块导入（兼容包内相对导入与扁平导入两种加载方式）
@@ -98,6 +108,134 @@ DEFAULT_RECORD_DEDUP_WINDOW = 2.0
 
 MEMORY_BLOCK_MARKER = "<!-- agent_memory:injected:v1 -->"
 """记忆注入块占位标记：用于识别并阻止同一请求内的重复注入。"""
+
+# ---------------------------------------------------------------------------
+# Stage 3：注入位置策略（支持主流大模型最佳实践）
+# ---------------------------------------------------------------------------
+POSITION_SYSTEM_HEAD = "system_head"
+POSITION_SYSTEM_TAIL = "system_tail"
+POSITION_USER_HEAD = "user_head"
+
+VALID_INJECT_POSITIONS = (
+    POSITION_SYSTEM_HEAD,
+    POSITION_SYSTEM_TAIL,
+    POSITION_USER_HEAD,
+)
+
+DEFAULT_INJECT_POSITION = POSITION_SYSTEM_HEAD
+"""默认注入位置：System Prompt 最前端。
+
+适配 Claude / GPT-4o 等对 System 指令权重高的模型。
+"""
+
+_POSITION_ALIASES: Dict[str, str] = {
+    # 标准三态
+    "system_head": POSITION_SYSTEM_HEAD,
+    "system_tail": POSITION_SYSTEM_TAIL,
+    "user_head": POSITION_USER_HEAD,
+    # 旧版二元兼容（Stage 2 使用 head / tail）
+    "head": POSITION_SYSTEM_HEAD,
+    "tail": POSITION_SYSTEM_TAIL,
+    # 常见同义写法，降低用户配置门槛
+    "system": POSITION_SYSTEM_HEAD,
+    "system_prompt_head": POSITION_SYSTEM_HEAD,
+    "system_prompt_tail": POSITION_SYSTEM_TAIL,
+    "prompt_head": POSITION_USER_HEAD,
+    "user": POSITION_USER_HEAD,
+    "query_head": POSITION_USER_HEAD,
+    "prepend": POSITION_SYSTEM_HEAD,
+    "append": POSITION_SYSTEM_TAIL,
+}
+
+
+def _normalize_inject_position(value: Any) -> str:
+    """
+    把任意配置值归一化为三种标准注入位置之一。
+
+    非法/空值统一回退 DEFAULT_INJECT_POSITION（system_head），保证路由永不失效。
+    """
+    raw = str(value or "").strip().lower()
+    # 容忍 "system-head" / "system head" 等分隔符差异
+    raw = raw.replace("-", "_").replace(" ", "_")
+    return _POSITION_ALIASES.get(raw, DEFAULT_INJECT_POSITION)
+
+
+def _to_plain_result(event: Any, text: str) -> Any:
+    """
+    把纯文本包装为宿主可发送的消息结果。
+
+    真实 AstrBot 提供 event.plain_result(text)；单测 / 兜底环境直接返回字符串。
+    """
+    if event is None:
+        return text
+    try:
+        plain = getattr(event, "plain_result", None)
+        if callable(plain):
+            return plain(text)
+    except Exception:
+        pass
+    return text
+
+
+def _extract_command_args(event: Any, subcommand: str) -> str:
+    """
+    从消息文本中剥离指令前缀，取出指令参数。
+
+    例："/memory recall 主人喜欢的茶" + subcommand="recall" → "主人喜欢的茶"
+    无法识别前缀时原样返回（保证参数不丢失）。
+    """
+    raw = str(
+        _first_non_empty(
+            _safe_attr(event, "message_str"),
+            _safe_attr(event, "message_text"),
+            default="",
+        )
+    ).strip()
+    if not raw:
+        return ""
+
+    sub = str(subcommand or "").strip()
+    if not sub:
+        return raw
+
+    escaped = re.escape(sub)
+    for pattern in (
+        rf"^\s*/?\s*memory\s+{escaped}\b\s*",
+        rf"^\s*/?\s*{escaped}\b\s*",
+    ):
+        stripped = re.sub(pattern, "", raw, count=1, flags=re.IGNORECASE)
+        if stripped != raw:
+            return stripped.strip()
+    return raw
+
+
+def _load_migrator_class() -> Optional[type]:
+    """
+    加载旧版资产迁移引擎，兼容「包内相对导入」与「扁平导入」两种加载方式。
+
+    migrator.py 内部以 `from storage import MemoryStorage` 扁平导入，
+    因此相对导入路径下需先把 storage 注册进 sys.modules 别名，避免 ImportError。
+    任何失败返回 None（/memory migrate 将给出友好提示，而非崩溃）。
+    """
+    # 相对导入路径：预注册 storage 别名，供 migrator 的扁平导入命中
+    try:
+        from . import storage as _storage_module
+
+        sys.modules.setdefault("storage", _storage_module)
+    except Exception:
+        pass
+
+    for importer in ("relative", "flat"):
+        try:
+            if importer == "relative":
+                from .migrator import MemoryMigrator  # type: ignore
+            else:
+                from migrator import MemoryMigrator  # type: ignore
+            return MemoryMigrator
+        except Exception as exc:
+            logger.debug("[agent_memory] migrator %s 导入失败: %s", importer, exc)
+    logger.warning("[agent_memory] 迁移引擎不可用，/memory migrate 将降级提示。")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +411,9 @@ class AgentMemoryPlugin(Star):
         self.rerank_client: Optional[RerankClient] = None
         self.summarizer: Optional[MemorySummarizer] = None
         self.retriever: Optional[MemoryRetriever] = None
+
+        # Stage 3：迁移引擎类（导入失败时为 None，指令层降级提示）
+        self._migrator_cls: Optional[type] = _load_migrator_class()
 
         self._initialized: bool = False
 
@@ -747,6 +888,19 @@ class AgentMemoryPlugin(Star):
             },
             "hook_stats": dict(self._hook_stats),
         }
+        # ---- Stage 3 注入策略快照 ----
+        try:
+            rc = self._retrieval_runtime_cfg()
+            status["injection"] = {
+                "position": rc["position"],
+                "position_label": self._position_label(rc["position"]),
+                "valid_positions": list(VALID_INJECT_POSITIONS),
+                "max_chars": rc["max_chars"],
+                "retrieve_timeout": rc["timeout"],
+                "turn_interval": self.turn_interval,
+            }
+        except Exception as exc:
+            logger.debug("[agent_memory] 解析注入策略失败: %s", exc)
         if self.summarizer is not None:
             try:
                 status["buffer"] = self.summarizer.get_buffer_stats()
@@ -776,7 +930,7 @@ class AgentMemoryPlugin(Star):
                 DEFAULT_INJECTION_MAX_CHARS,
                 minimum=0,
             ),
-            "position": str(cfg.get("inject_position") or "head").strip().lower(),
+            "position": _normalize_inject_position(cfg.get("inject_position")),
         }
 
     @staticmethod
@@ -874,30 +1028,42 @@ class AgentMemoryPlugin(Star):
         return self.format_memory_block(result, rc["max_chars"])
 
     @staticmethod
-    def _apply_block_to_request(req: Any, block: str, position: str = "head") -> bool:
+    def _apply_block_to_request(
+        req: Any, block: str, position: str = DEFAULT_INJECT_POSITION
+    ) -> bool:
         """
-        把记忆块写入 req.system_prompt。
-        - 已含 MARKER → 视为同一请求已注入，跳过（防工具调用多轮重复注入）；
-        - position=head 前置 / tail 后置。
+        按注入位置策略把记忆块写入请求对象。
+
+        三种路由（Stage 3）：
+        - system_head : 写入 req.system_prompt 最前端（默认；适配 Claude / GPT-4o）
+        - system_tail : 写入 req.system_prompt 最末端（紧贴人设提示词之后）
+        - user_head   : 写入 req.prompt 最前端（适配 DeepSeek / Qwen 等对即时提问敏感的模型）
+
+        幂等保护：目标字段中已存在 MEMORY_BLOCK_MARKER 时视为已注入，直接跳过
+        （防工具调用多轮导致的重复注入）。
         返回是否实际写入。
         """
         if req is None or not block:
             return False
-        try:
-            existing = str(_safe_attr(req, "system_prompt", "") or "")
-        except Exception:
-            existing = ""
 
+        pos = _normalize_inject_position(position)
+
+        # user_head 改写用户 Query，其余两种改写 System Prompt
+        target_attr = "prompt" if pos == POSITION_USER_HEAD else "system_prompt"
+        existing = str(_safe_attr(req, target_attr, "") or "")
+
+        # 同一请求内幂等：目标字段已含标记则不再注入
         if MEMORY_BLOCK_MARKER in existing:
             return False
 
-        if position == "tail":
+        if pos == POSITION_SYSTEM_TAIL:
             merged = f"{existing}\n\n{block}" if existing else block
         else:
+            # system_head / user_head 均为前插
             merged = f"{block}\n\n{existing}" if existing else block
 
         try:
-            req.system_prompt = merged
+            setattr(req, target_attr, merged)
             return True
         except Exception:
             # 少数宿主实现为只读属性：静默放弃
@@ -1019,6 +1185,324 @@ class AgentMemoryPlugin(Star):
             return False
 
     # ------------------------------------------------------------------
+    # Stage 3：管理指令实现（返回纯文本，便于复用与单测）
+    #   约定：cmd_* 为纯函数式处理器，绝不抛异常，始终返回可读文本；
+    #         memory_* 为 @command 装饰后的宿主入口，负责包装为消息结果。
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _position_label(position: str) -> str:
+        """把注入位置常量翻译为人类可读说明。"""
+        labels = {
+            POSITION_SYSTEM_HEAD: "System Prompt 最前端（推荐：Claude / GPT-4o）",
+            POSITION_SYSTEM_TAIL: "System Prompt 最末端（紧贴人设之后）",
+            POSITION_USER_HEAD: "用户 Query 最前端（推荐：DeepSeek / Qwen）",
+        }
+        return labels.get(_normalize_inject_position(position), str(position))
+
+    def _component_health(self) -> Dict[str, Any]:
+        """
+        探测 Embedding / Rerank 模型连接的可用性。
+
+        判定口径：
+        - 未装配 → present=False
+        - 已装配但未配置 api_key → 客户端会走本地降级（零向量 / RRF），视为 unhealthy
+        - 已装配且有 api_key → healthy=True（真实连通性由运行时请求兜底，此处不做网络探测）
+        """
+        emb = self.embedding_client
+        rerank = self.rerank_client
+
+        emb_key = str(_safe_attr(emb, "api_key", "") or "").strip()
+        rerank_key = str(_safe_attr(rerank, "api_key", "") or "").strip()
+
+        return {
+            "embedding": {
+                "present": emb is not None,
+                "has_key": bool(emb_key),
+                "model": str(_safe_attr(emb, "model", "") or ""),
+                "healthy": emb is not None and bool(emb_key),
+            },
+            "rerank": {
+                "present": rerank is not None,
+                "has_key": bool(rerank_key),
+                "model": str(_safe_attr(rerank, "model", "") or ""),
+                "healthy": rerank is not None and bool(rerank_key),
+            },
+        }
+
+    async def cmd_status(self, event: Any = None) -> str:
+        """/memory status：输出分层记忆体量、注入策略、模型健康度与钩子统计。"""
+        lines: List[str] = ["## 🧠 分层记忆状态"]
+
+        # ---- 1. 分层体量 ----
+        tiers: Dict[str, int] = {
+            "l1_docs": 0,
+            "l2_atoms": 0,
+            "l2_pinned": 0,
+            "kg_nodes": 0,
+            "kg_edges": 0,
+            "task_dlq": 0,
+        }
+        if self.storage is not None:
+            try:
+                tiers.update(self.storage.get_tier_stats() or {})
+            except Exception as exc:
+                logger.debug("[agent_memory] 获取分层体量失败: %s", exc)
+
+        pending_turns = 0
+        active_sessions = 0
+        if self.summarizer is not None:
+            try:
+                buf = self.summarizer.get_buffer_stats()
+                pending_turns = int(buf.get("pending_turns", 0) or 0)
+                active_sessions = int(buf.get("active_sessions", 0) or 0)
+            except Exception as exc:
+                logger.debug("[agent_memory] 获取缓冲统计失败: %s", exc)
+
+        lines.append(
+            f"- **体量**: L1 历史 `{tiers['l1_docs']}` 条 · "
+            f"L1 待总结 `{pending_turns}` 轮（{active_sessions} 会话） · "
+            f"L2 原子 `{tiers['l2_atoms']}` 条 · "
+            f"L3 置顶 `{tiers['l2_pinned']}` 条 · "
+            f"图谱 `{tiers['kg_nodes']}` 节点 / `{tiers['kg_edges']}` 关系"
+        )
+
+        # ---- 2. 注入策略 ----
+        try:
+            rc = self._retrieval_runtime_cfg()
+            position = rc["position"]
+        except Exception:
+            position = DEFAULT_INJECT_POSITION
+        lines.append(
+            f"- **策略**: 注入位置 `{position}`（{self._position_label(position)}） · "
+            f"总结阈值 `{self.turn_interval}` 轮/批 · "
+            f"记忆总开关 `{'开启' if self.enable_memory else '关闭'}` · "
+            f"注入开关 `{'开启' if self.enable_injection else '关闭'}`"
+        )
+
+        # ---- 3. 模型健康度 ----
+        health = self._component_health()
+        emb_h = health["embedding"]
+        rr_h = health["rerank"]
+
+        if not emb_h["present"]:
+            emb_text = "❌ 未装配"
+        elif emb_h["healthy"]:
+            emb_text = f"✅ 可用（{emb_h['model'] or 'embedding'}）"
+        else:
+            emb_text = "⚠️ 未配置密钥（零向量降级）"
+
+        if not rr_h["present"]:
+            rr_text = "❌ 未装配"
+        elif rr_h["healthy"]:
+            rr_text = f"✅ 可用（{rr_h['model'] or 'rerank'}）"
+        else:
+            rr_text = "⚠️ 未配置密钥（本地 RRF 降级）"
+
+        lines.append(f"- **模型**: Embedding {emb_text} · Rerank {rr_text}")
+
+        # ---- 4. 双向钩子统计 ----
+        stats = self._hook_stats
+        lines.append(
+            f"- **钩子**: 注入 成功 `{stats.get('inject_ok', 0)}` / "
+            f"跳过 `{stats.get('inject_skip', 0)}` / 降级 `{stats.get('inject_error', 0)}` · "
+            f"记录 成功 `{stats.get('record_ok', 0)}` / "
+            f"跳过 `{stats.get('record_skip', 0)}` / 降级 `{stats.get('record_error', 0)}`"
+        )
+
+        return "\n".join(lines)
+
+    async def cmd_recall(self, event: Any = None, query: str = "") -> str:
+        """/memory recall <query>：手动执行两阶段检索并打印 L3 置顶项与 L2 精排分数。"""
+        q = str(query or "").strip()
+        if not q:
+            q = _extract_command_args(event, "recall")
+
+        if not q:
+            return (
+                "## 🔍 记忆检索测试\n"
+                "❌ 请提供检索关键词，例如：`/memory recall 主人喜欢的茶`"
+            )
+
+        header = f"## 🔍 记忆检索测试\n- Query: `{q}`"
+
+        if self.retriever is None:
+            return f"{header}\n❌ 检索器未装配，无法执行检索。"
+        if not self.enable_memory:
+            return f"{header}\n⚠️ 记忆总开关已关闭（enable_memory=False）。"
+
+        try:
+            result = await self.retrieve_memory(q)
+        except Exception as exc:
+            logger.error("[agent_memory] cmd_recall 检索异常: %s", exc, exc_info=True)
+            return f"{header}\n❌ 检索异常: {exc}"
+
+        pinned = result.get("pinned_l3") or []
+        retrieved = result.get("retrieved_l2") or []
+
+        sections: List[str] = [header]
+
+        # ---- L3 置顶 ----
+        sections.append(f"### 📌 L3 置顶 ({len(pinned)})")
+        if pinned:
+            for idx, item in enumerate(pinned, start=1):
+                if not isinstance(item, dict):
+                    continue
+                content = str(item.get("content", "")).strip()
+                if not content:
+                    continue
+                atom_type = str(item.get("atom_type", "preference"))
+                atom_id = str(item.get("atom_id", "")) or "-"
+                try:
+                    importance = float(item.get("importance", 0.0))
+                except (TypeError, ValueError):
+                    importance = 0.0
+                sections.append(
+                    f"{idx}. `{atom_id}` **[{atom_type}]** {content} "
+                    f"*(重要度 {importance:.2f})*"
+                )
+        else:
+            sections.append("- （无置顶记忆）")
+
+        # ---- L2 精排 ----
+        sections.append(f"### 🎯 L2 精排 Top{len(retrieved)}")
+        if retrieved:
+            for idx, item in enumerate(retrieved, start=1):
+                if not isinstance(item, dict):
+                    continue
+                content = str(item.get("content", "")).strip()
+                if not content:
+                    continue
+                atom_id = str(item.get("atom_id", "")) or "-"
+                try:
+                    score = float(item.get("relevance_score", 0.0))
+                except (TypeError, ValueError):
+                    score = 0.0
+                sections.append(f"{idx}. `score={score:.4f}` `{atom_id}` {content}")
+        else:
+            sections.append("- （未命中相关情景记忆）")
+
+        return "\n".join(sections)
+
+    async def cmd_pin(self, event: Any = None, atom_id: str = "") -> str:
+        """/memory pin <id>：切换原子记忆的 L3 置顶状态，并回显操作结果。"""
+        aid = str(atom_id or "").strip()
+        if not aid:
+            aid = _extract_command_args(event, "pin")
+
+        header = "## 📌 记忆置顶"
+        if not aid:
+            return f"{header}\n❌ 请提供原子记忆 ID，例如：`/memory pin atom_xxx`"
+        if self.storage is None:
+            return f"{header}\n❌ 存储未装配，无法执行置顶操作。"
+
+        try:
+            result = self.storage.toggle_atom_pin(aid)
+        except Exception as exc:
+            logger.error("[agent_memory] cmd_pin 异常: %s", exc, exc_info=True)
+            return f"{header}\n❌ 操作异常: {exc}"
+
+        if not result.get("found"):
+            reason = str(result.get("error") or "").strip()
+            suffix = f"（{reason}）" if reason else ""
+            return f"{header}\n❌ 未找到原子记忆 `{aid}`{suffix}"
+
+        content = str(result.get("content", "")).strip() or "（空内容）"
+        if len(content) > 100:
+            content = content[:100] + "..."
+
+        if result.get("was_pinned"):
+            action = "✅ 已取消置顶（L3 → L2 降级）"
+        else:
+            action = "✅ 已置顶（L2 → L3 晋升）"
+
+        return (
+            f"{header}\n{action}\n"
+            f"- ID: `{aid}`\n"
+            f"- 内容: {content}\n"
+            f"- 当前状态: pinned={1 if result.get('is_pinned') else 0}"
+        )
+
+    async def cmd_migrate(self, event: Any = None) -> str:
+        """/memory migrate：从旧版 livingmemory 平滑迁移资产，并回显迁移统计。"""
+        header = "## 📦 旧版记忆资产迁移"
+        lines: List[str] = [header]
+
+        if self._migrator_cls is None:
+            lines.append("❌ 迁移引擎不可用（migrator 模块导入失败），请检查插件完整性。")
+            return "\n".join(lines)
+        if self.storage is None:
+            lines.append("❌ 存储未装配，无法执行迁移。")
+            return "\n".join(lines)
+
+        migration_cfg = self._section("migration")
+
+        # 源库定位：配置优先，其次自动探测旧插件数据目录
+        raw_source = str(migration_cfg.get("source_db_path") or "").strip()
+        if raw_source:
+            source_path = Path(raw_source).expanduser()
+        else:
+            try:
+                legacy_dir = _resolve_plugin_data_dir("astrbot_plugin_livingmemory")
+                source_path = legacy_dir / "livingmemory.db"
+            except Exception as exc:
+                logger.debug("[agent_memory] 探测旧库目录失败: %s", exc)
+                lines.append("❌ 未能定位旧版 livingmemory.db，请在配置 `migration.source_db_path` 指定路径。")
+                return "\n".join(lines)
+
+        lines.append(f"- 源库: `{source_path}`")
+
+        if not source_path.is_file() or source_path.stat().st_size <= 0:
+            lines.append("❌ 源数据库不存在或为空，迁移已跳过。")
+            return "\n".join(lines)
+
+        force = bool(migration_cfg.get("force", False))
+        dry_run = bool(migration_cfg.get("dry_run", False))
+        lines.append(f"- 模式: `{'dry-run 预览' if dry_run else '正式迁移'}`（force={force}）")
+
+        try:
+            migrator = self._migrator_cls(
+                source_db_path=source_path,
+                storage=self.storage,
+            )
+            result = migrator.migrate(dry_run=dry_run, force=force)
+        except Exception as exc:
+            logger.error("[agent_memory] cmd_migrate 异常: %s", exc, exc_info=True)
+            lines.append(f"❌ 迁移执行异常: {exc}")
+            return "\n".join(lines)
+
+        if not isinstance(result, dict):
+            lines.append(f"❌ 迁移返回结果格式异常: {type(result).__name__}")
+            return "\n".join(lines)
+
+        status = str(result.get("status", ""))
+        mapped = result.get("mapped_counts") or {}
+
+        lines.append(f"- 状态: `{status}`")
+        if mapped:
+            lines.append(
+                f"- 迁移统计: L1 `{mapped.get('l1_docs', 0)}` 条 · "
+                f"L2 `{mapped.get('l2_atoms', 0)}` 条"
+                f"（置顶 `{mapped.get('l2_atoms_pinned_tier3', 0)}`） · "
+                f"图谱 `{mapped.get('kg_nodes', 0)}` 节点 / `{mapped.get('kg_edges', 0)}` 关系"
+                f"（孤儿边跳过 `{mapped.get('kg_edges_skipped_orphan', 0)}`）"
+            )
+        if result.get("backup_path"):
+            lines.append(f"- 安全快照: `{result['backup_path']}`")
+        if result.get("duration_sec") is not None:
+            lines.append(f"- 耗时: `{result.get('duration_sec')}` 秒")
+        if result.get("error"):
+            lines.append(f"- 说明: {result['error']}")
+
+        if status.startswith("migrated"):
+            lines.append("✅ 数据无损迁移完成")
+        elif status.startswith("dry_run"):
+            lines.append("ℹ️ 预览完成，未写入目标库")
+        else:
+            lines.append("ℹ️ 迁移未写入目标库（详见上方状态说明）")
+
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Stage 2 钩子装配：双向拦截
     # 1) on_llm_request       → 前置记忆注入（写 req.system_prompt）
     # 2) on_llm_response      → 后置轮次记录（读 resp.completion_text）
@@ -1059,3 +1543,59 @@ class AgentMemoryPlugin(Star):
                 logger.warning(
                     "[agent_memory] on_decorating_result 兜底钩子异常(已忽略): %s", exc
                 )
+
+    # ------------------------------------------------------------------
+    # Stage 3 指令装配：/memory status | recall | pin | migrate
+    # 优先使用指令组（filter.command_group），无该能力时降级为扁平指令；
+    # 任一 API 缺失或装配异常都只记录告警，绝不影响插件加载与钩子运行。
+    # ------------------------------------------------------------------
+    try:
+        if _COMMAND_GROUP is not None:
+
+            @_COMMAND_GROUP("memory")  # type: ignore[misc]
+            def memory(self) -> None:
+                """分层记忆管理指令组（/memory status|recall|pin|migrate）。"""
+                pass
+
+            @memory.command("status")  # type: ignore[union-attr]
+            async def memory_status(self, event: Any = None):
+                """查看分层记忆体量、注入策略、模型健康度与钩子统计。"""
+                yield _to_plain_result(event, await self.cmd_status(event))
+
+            @memory.command("recall")  # type: ignore[union-attr]
+            async def memory_recall(self, event: Any = None, query: str = ""):
+                """手动执行两阶段检索测试，打印 L3 置顶与 L2 精排分数。"""
+                yield _to_plain_result(event, await self.cmd_recall(event, query))
+
+            @memory.command("pin")  # type: ignore[union-attr]
+            async def memory_pin(self, event: Any = None, atom_id: str = ""):
+                """切换指定原子记忆的 L3 置顶状态。"""
+                yield _to_plain_result(event, await self.cmd_pin(event, atom_id))
+
+            @memory.command("migrate")  # type: ignore[union-attr]
+            async def memory_migrate(self, event: Any = None):
+                """从旧版 livingmemory 平滑迁移记忆资产。"""
+                yield _to_plain_result(event, await self.cmd_migrate(event))
+
+        elif _COMMAND is not None:  # pragma: no cover - 扁平指令降级分支
+
+            @_COMMAND("memory_status")  # type: ignore[misc]
+            async def memory_status(self, event: Any = None):  # noqa: F811
+                yield _to_plain_result(event, await self.cmd_status(event))
+
+            @_COMMAND("memory_recall")  # type: ignore[misc]
+            async def memory_recall(self, event: Any = None):  # noqa: F811
+                query = _extract_command_args(event, "recall")
+                yield _to_plain_result(event, await self.cmd_recall(event, query))
+
+            @_COMMAND("memory_pin")  # type: ignore[misc]
+            async def memory_pin(self, event: Any = None):  # noqa: F811
+                atom_id = _extract_command_args(event, "pin")
+                yield _to_plain_result(event, await self.cmd_pin(event, atom_id))
+
+            @_COMMAND("memory_migrate")  # type: ignore[misc]
+            async def memory_migrate(self, event: Any = None):  # noqa: F811
+                yield _to_plain_result(event, await self.cmd_migrate(event))
+    except Exception as exc:  # pragma: no cover
+        logger.warning("[agent_memory] 管理指令装配失败(已忽略): %s", exc)
+

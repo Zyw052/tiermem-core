@@ -185,8 +185,8 @@
       "inject_position": {
         "description": "记忆块注入位置",
         "type": "string",
-        "default": "head",
-        "hint": "head=System Prompt 前部（推荐）；tail=尾部"
+        "default": "system_head",
+        "hint": "system_head=System Prompt 最前端（默认，推荐 Claude/GPT-4o）；system_tail=System Prompt 最末端（紧贴人设之后）；user_head=用户 Query 最前端（推荐 DeepSeek/Qwen 等对即时提问敏感的模型）"
       },
       "record_dedup_window": {
         "description": "轮次记录去重时间窗（秒）",
@@ -204,6 +204,24 @@
         "description": "启动时自动检测旧插件记忆资产",
         "type": "bool",
         "default": true
+      },
+      "source_db_path": {
+        "description": "旧版 livingmemory.db 路径",
+        "type": "string",
+        "default": "",
+        "hint": "留空则自动探测 astrbot_plugin_livingmemory 插件数据目录下的 livingmemory.db"
+      },
+      "force": {
+        "description": "目标库非空时仍强制迁移",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后 /memory migrate 会覆盖合并写入已有数据，请谨慎使用"
+      },
+      "dry_run": {
+        "description": "仅预览迁移统计不写入",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后 /memory migrate 只做只读统计，不修改目标库"
       }
     }
   },
