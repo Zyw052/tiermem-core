@@ -13,5 +13,11 @@
       "save": "保存配置",
       "reload": "重新载入"
     }
+  },
+  "pages": {
+    "dashboard": {
+      "title": "记忆面板",
+      "description": "通电自检、配置在线保存、记忆浏览、图谱与 DLQ 运维"
+    }
   }
 }

@@ -13,5 +13,11 @@
       "save": "Save config",
       "reload": "Reload"
     }
+  },
+  "pages": {
+    "dashboard": {
+      "title": "Memory Dashboard",
+      "description": "Health check, live config save, memory browsing, graph and DLQ ops"
+    }
   }
 }
