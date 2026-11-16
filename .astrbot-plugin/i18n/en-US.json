@@ -1,0 +1,17 @@
+{
+  "metadata": {
+    "display_name": "TierMem Core",
+    "short_desc": "Tiered long-term memory with a built-in dashboard",
+    "desc": "Lightweight tiered long-term memory core with a built-in WebUI dashboard."
+  },
+  "views": {
+    "dashboard": {
+      "title": "Memory Dashboard",
+      "description": "Health check, live config save, memory browsing, graph and DLQ ops",
+      "subtitle": "Tiered memory · health / config / memories / graph / maintenance",
+      "refresh": "Refresh",
+      "save": "Save config",
+      "reload": "Reload"
+    }
+  }
+}

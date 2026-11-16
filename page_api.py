@@ -2,7 +2,15 @@
 """
 astrbot_plugin_agent_memory - 插件 WebUI 后端 API (page_api.py)
 
-依据（宿主源码，非猜测）：
+规范依据（astrbot-plugin-dev，产出注明依据章节）：
+  §3 main.py —— 插件初始化阶段用 context.register_web_api 注册页面 API
+  §6 配置 —— _conf_schema.json / AstrBotConfig.save_config
+  §9 存储 —— 持久化数据落 data/plugin_data/<plugin>/
+  §10 工程规范 —— from astrbot.api import logger、异步网络库、ruff、异常处理
+  WebUI 专章 guides/plugin-pages.md —— 「后端 Web API / 路由注册」「请求对象」
+    「响应对象 / Quart 兼容」「Bridge API / 请求和返回值规则」「安全约束」
+
+宿主源码实证（v4.29.4，非猜测）：
     - ``Context.register_web_api(route, view_handler, methods, desc)``
       → astrbot/core/star/context.py:774
     - 路由匹配语法为 Quart 风格 ``<param>`` / ``<path:param>``
@@ -135,6 +143,14 @@ class PluginPageApi:
         ("providers", "get_providers", ["GET"], "宿主服务商清单与当前绑定"),
         ("bindings", "save_bindings", ["POST"], "保存运行期服务商绑定并热重建"),
         ("recall", "recall", ["GET"], "手动召回测试（观察检索与注入结果）"),
+        # ---- 本次补全：配置在线查看/保存、连通性测试、记忆写操作、图谱、维护 ----
+        ("config", "get_config", ["GET"], "在线查看插件配置（敏感字段掩码）"),
+        ("config/save", "save_config", ["POST"], "在线保存配置并热更新（不重载主进程）"),
+        ("providers/test", "test_provider", ["POST"], "服务商连通性测试（不返回密钥）"),
+        ("memories/edit", "update_memory", ["POST"], "编辑记忆正文/重要度/关键事实/主题"),
+        ("memories/delete", "delete_memory", ["POST"], "删除记忆及关联图谱边"),
+        ("graph", "get_graph", ["GET"], "知识图谱节点与关系浏览"),
+        ("maintenance", "run_maintenance", ["POST"], "维护：flush/rebuild_fts/retry_dlq/migrate_preview"),
     )
 
     def __init__(self, plugin: Any) -> None:
@@ -404,6 +420,275 @@ class PluginPageApi:
         except Exception as exc:
             logger.error("[agent_memory] page.recall 失败: %s", exc, exc_info=True)
             return err(f"召回测试失败: {exc}")
+
+    # ==================================================================
+    # 本次补全：配置 / 连通性 / 记忆写操作 / 图谱 / 维护
+    # 约定：全部处理器不抛异常，失败统一返回 {"status": "error", ...}
+    # ==================================================================
+    def _invalidate_cache(self) -> None:
+        """写操作后清理检索侧缓存（失败忽略，不影响主链路）。"""
+        retriever = getattr(self.plugin, "retriever", None)
+        fn = getattr(retriever, "invalidate_cache", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception as exc:  # pragma: no cover
+                logger.debug("[agent_memory] 清理检索缓存失败（忽略）: %s", exc)
+
+    @staticmethod
+    def _load_config_manager():
+        """兼容包内相对导入与扁平导入两种加载方式。"""
+        try:
+            from .config_api import ConfigError, ConfigManager  # type: ignore
+
+            return ConfigManager, ConfigError
+        except ImportError:  # pragma: no cover
+            from config_api import ConfigError, ConfigManager  # type: ignore
+
+            return ConfigManager, ConfigError
+
+    # -- GET /config -------------------------------------------------------
+    async def get_config(self, **_: Any) -> Dict[str, Any]:
+        """在线查看插件配置；api_key / token / secret 一律掩码，绝不返回明文。"""
+        try:
+            manager_cls, _ = self._load_config_manager()
+            return ok(manager_cls(self.plugin).view())
+        except ImportError:
+            return err("配置模块不可用")
+        except Exception as exc:
+            logger.error("[agent_memory] page.config 失败: %s", exc, exc_info=True)
+            return err(f"读取配置失败: {exc}")
+
+    # -- POST /config/save -------------------------------------------------
+    async def save_config(self, **_: Any) -> Dict[str, Any]:
+        """在线保存配置：白名单校验 → 原子写 → 运行时热更新（不重载/不重启）。"""
+        try:
+            manager_cls, config_error = self._load_config_manager()
+        except ImportError:
+            return err("配置模块不可用")
+        try:
+            body = await _json_body()
+            # 安全开关：webui.allow_config_write=false 时面板只读，拒绝任何写入
+            runtime_cfg = getattr(self.plugin, "config", None)
+            if isinstance(runtime_cfg, dict):
+                webui_cfg = runtime_cfg.get("webui")
+                if isinstance(webui_cfg, dict) and not bool(
+                    webui_cfg.get("allow_config_write", True)
+                ):
+                    return err("面板配置写入已被 webui.allow_config_write=false 禁用")
+            # 兼容 {"config": {...}} 与直接提交 {...} 两种前端载荷
+            payload = body.get("config") if isinstance(body.get("config"), dict) else body
+            result = manager_cls(self.plugin).save(payload)
+            return ok(result)
+        except config_error as exc:
+            return err(str(exc))
+        except Exception as exc:
+            logger.error("[agent_memory] page.config-save 失败: %s", exc, exc_info=True)
+            return err(f"保存配置失败: {exc}")
+
+    # -- POST /providers/test ---------------------------------------------
+    async def test_provider(self, **_: Any) -> Dict[str, Any]:
+        """服务商连通性测试：轻量真实调用 + 超时保护，绝不返回任何密钥。"""
+        import asyncio
+
+        try:
+            body = await _json_body()
+            kind = str(body.get("kind") or "").strip().lower()
+            kind = {"chat": "chat_completion", "llm": "chat_completion"}.get(kind, kind)
+            if kind not in ("embedding", "rerank", "chat_completion"):
+                return err("kind 必须是 embedding / rerank / chat_completion")
+            provider_id = str(body.get("provider_id") or "").strip()[:200]
+            bridge = getattr(self.plugin, "provider_bridge", None)
+            if bridge is None:
+                return err("服务商桥接未初始化")
+
+            # 指定 provider_id 时先核对能力清单（只比对 id，不外泄凭证）
+            if provider_id:
+                try:
+                    bucket = (bridge.list_providers() or {}).get(kind) or []
+                    if not any(str(p.get("id")) == provider_id for p in bucket):
+                        return err(f"服务商 {provider_id} 不在 {kind} 清单中")
+                except Exception as exc:
+                    return err(f"读取服务商清单失败: {exc}")
+            auto = not bool(provider_id)
+
+            async def _probe() -> Dict[str, Any]:
+                if kind == "embedding":
+                    backend = bridge.build_embedding_backend(provider_id, allow_auto=auto)
+                    if backend is None:
+                        raise RuntimeError("未找到可用 Embedding 服务商")
+                    vec = await backend.embed_one("TierMem connectivity probe")
+                    return {
+                        "dim": len(vec),
+                        "model": str(getattr(backend, "model", "") or ""),
+                        "effective_provider_id": str(getattr(backend, "provider_id", "") or ""),
+                    }
+                if kind == "rerank":
+                    backend = bridge.build_rerank_backend(provider_id, allow_auto=auto)
+                    if backend is None:
+                        raise RuntimeError("未找到可用 Rerank 服务商")
+                    ranked = await backend.rerank(
+                        "分层记忆连通性测试", ["记忆可用", "无关文本"]
+                    )
+                    return {
+                        "results": len(ranked),
+                        "model": str(getattr(backend, "model", "") or ""),
+                        "effective_provider_id": str(getattr(backend, "provider_id", "") or ""),
+                    }
+                backend = bridge.build_chat_backend(provider_id, allow_auto=auto)
+                if backend is None:
+                    raise RuntimeError("未找到可用对话服务商")
+                text = await backend.chat(
+                    [{"role": "user", "content": "请只回复 OK 两个字符。"}]
+                )
+                return {
+                    "reply_preview": str(text or "")[:60],
+                    "model": str(getattr(backend, "model", "") or ""),
+                    "effective_provider_id": str(getattr(backend, "provider_id", "") or ""),
+                }
+
+            started = time.time()
+            try:
+                detail = await asyncio.wait_for(_probe(), timeout=10.0)
+            except asyncio.TimeoutError:
+                return err(
+                    "连通性测试超时（10 秒）",
+                    {"kind": kind, "provider_id": provider_id},
+                )
+            return ok(
+                {
+                    "kind": kind,
+                    "provider_id": provider_id,
+                    "elapsed_ms": int((time.time() - started) * 1000),
+                    **detail,
+                }
+            )
+        except Exception as exc:
+            logger.error("[agent_memory] page.provider-test 失败: %s", exc, exc_info=True)
+            return err(f"连通性测试失败: {exc}")
+
+    # -- POST /memories/edit ----------------------------------------------
+    async def update_memory(self, **_: Any) -> Dict[str, Any]:
+        """编辑记忆正文 / 重要度 / 关键事实 / 主题（参数化 SQL，输入强校验）。"""
+        try:
+            body = await _json_body()
+            atom_id = str(body.get("atom_id") or "").strip()
+            if not atom_id:
+                return err("缺少 atom_id")
+            storage = getattr(self.plugin, "storage", None)
+            if storage is None:
+                return err("存储未就绪")
+            fn = getattr(storage, "update_memory", None)
+            if not callable(fn):
+                return err("存储不支持编辑操作")
+            result = fn(
+                atom_id,
+                content=body.get("content"),
+                importance=body.get("importance"),
+                key_facts=body.get("key_facts"),
+                topics=body.get("topics"),
+            )
+            if not isinstance(result, dict) or result.get("error"):
+                return err(str((result or {}).get("error") or "编辑失败"), result)
+            self._invalidate_cache()
+            return ok(result)
+        except Exception as exc:
+            logger.error("[agent_memory] page.memory-edit 失败: %s", exc, exc_info=True)
+            return err(f"编辑记忆失败: {exc}")
+
+    # -- POST /memories/delete --------------------------------------------
+    async def delete_memory(self, **_: Any) -> Dict[str, Any]:
+        """删除记忆及关联图谱边；必须显式 confirm=true，防止误删。"""
+        try:
+            body = await _json_body()
+            atom_id = str(body.get("atom_id") or "").strip()
+            if not atom_id:
+                return err("缺少 atom_id")
+            if body.get("confirm") is not True:
+                return err("删除操作需要显式 confirm=true")
+            storage = getattr(self.plugin, "storage", None)
+            if storage is None:
+                return err("存储未就绪")
+            fn = getattr(storage, "delete_memory", None)
+            if not callable(fn):
+                return err("存储不支持删除操作")
+            result = fn(atom_id)
+            if not isinstance(result, dict) or result.get("error"):
+                return err(str((result or {}).get("error") or "删除失败"), result)
+            self._invalidate_cache()
+            return ok(result)
+        except Exception as exc:
+            logger.error("[agent_memory] page.memory-delete 失败: %s", exc, exc_info=True)
+            return err(f"删除记忆失败: {exc}")
+
+    # -- GET /graph --------------------------------------------------------
+    async def get_graph(self, **_: Any) -> Dict[str, Any]:
+        """知识图谱（L3）节点与关系浏览，支持 q 关键词与 limit 上限。"""
+        try:
+            storage = getattr(self.plugin, "storage", None)
+            if storage is None:
+                return err("存储未就绪")
+            fn = getattr(storage, "list_kg_graph", None)
+            if not callable(fn):
+                return err("存储不支持图谱浏览")
+            return ok(
+                fn(
+                    limit=_query_int("limit", 100, 1, 300),
+                    query=_query_one("q", ""),
+                )
+            )
+        except Exception as exc:
+            logger.error("[agent_memory] page.graph 失败: %s", exc, exc_info=True)
+            return err(f"读取图谱失败: {exc}")
+
+    # -- POST /maintenance -------------------------------------------------
+    async def run_maintenance(self, **_: Any) -> Dict[str, Any]:
+        """维护操作白名单：flush / rebuild_fts / retry_dlq / migrate_preview。"""
+        allowed = ("flush", "rebuild_fts", "retry_dlq", "migrate_preview")
+        try:
+            body = await _json_body()
+            op = str(body.get("op") or "").strip()
+            if op not in allowed:
+                return err("op 必须是 " + " / ".join(allowed))
+            started = time.time()
+            data: Dict[str, Any] = {"op": op}
+
+            if op == "flush":
+                summarizer = getattr(self.plugin, "summarizer", None)
+                flush = getattr(summarizer, "flush_all", None)
+                if not callable(flush):
+                    return err("总结器未就绪")
+                data["flushed"] = await flush()
+            elif op == "rebuild_fts":
+                storage = getattr(self.plugin, "storage", None)
+                rebuild = getattr(storage, "rebuild_fts_index", None)
+                if not callable(rebuild):
+                    return err("存储未就绪")
+                data["indexed"] = rebuild()
+            elif op == "retry_dlq":
+                summarizer = getattr(self.plugin, "summarizer", None)
+                sweep = getattr(summarizer, "sweep_dlq_once", None)
+                if not callable(sweep):
+                    return err("总结器未就绪")
+                data["sweep"] = await sweep()
+            elif op == "migrate_preview":
+                cls = getattr(self.plugin, "_migrator_cls", None)
+                storage = getattr(self.plugin, "storage", None)
+                if cls is None or storage is None:
+                    return err("迁移器/存储未就绪")
+                migrator = cls(storage=storage)
+                if not migrator.check_source_exists():
+                    data["status"] = "no_source"
+                    data["source_db"] = str(getattr(migrator, "source_db_path", ""))
+                else:
+                    # dry_run=True 只读统计，不写目标库、不生成快照
+                    data["preview"] = migrator.migrate(dry_run=True)
+
+            data["elapsed_ms"] = int((time.time() - started) * 1000)
+            return ok(data)
+        except Exception as exc:
+            logger.error("[agent_memory] page.maintenance 失败: %s", exc, exc_info=True)
+            return err(f"维护操作失败: {exc}")
 
 
 def _effective_provider_snapshot(plugin: Any) -> Dict[str, Any]:

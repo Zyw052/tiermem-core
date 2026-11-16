@@ -240,6 +240,7 @@
         "description": "判官 API 密钥",
         "type": "string",
         "default": "",
+        "secret": true,
         "invisible": true
       },
       "timeout_seconds": {
@@ -332,7 +333,7 @@
   },
   "webui": {
     "description": "记忆面板（插件页面）",
-    "hint": "在 AstrBot「插件」页打开本插件页面即可查看通电自检、L1/L2/KG/DLQ 统计、记忆浏览与噪声排查。",
+    "hint": "在 AstrBot「插件」页打开本插件页面即可查看通电自检、L1/L2/KG/DLQ 统计、记忆浏览与噪声排查；面板内「配置」页签可在线查看并保存本插件配置（密钥掩码显示），不依赖原生配置弹窗、不会自动重载或重启。",
     "type": "object",
     "items": {
       "register_api": {
@@ -340,6 +341,12 @@
         "type": "bool",
         "default": true,
         "hint": "关闭后插件页面仍可打开，但数据接口返回 404。改动需重载插件生效。"
+      },
+      "allow_config_write": {
+        "description": "允许面板保存配置",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后面板「配置」页签仍可查看，但保存接口会拒绝写入（只读模式）。适合多人共管时锁定配置。"
       }
     }
   },
@@ -387,7 +394,8 @@
       "api_key": {
         "description": "手动 API 密钥",
         "type": "string",
-        "default": ""
+        "default": "",
+        "secret": true
       },
       "model": {
         "description": "手动模型名称",
@@ -434,64 +442,28 @@
     "items": {
       "embedding": {
         "description": "Embedding 模型",
-        "type": "object",
-        "items": {
-          "api_base": {
-            "description": "API 地址",
-            "type": "string",
-            "default": ""
-          },
-          "api_key": {
-            "description": "API 密钥",
-            "type": "string",
-            "default": ""
-          },
-          "model": {
-            "description": "模型名称",
-            "type": "string",
-            "default": "BAAI/bge-m3"
-          },
-          "dim": {
-            "description": "向量维度",
-            "type": "int",
-            "default": 1024
-          },
-          "timeout": {
-            "description": "请求超时(秒)",
-            "type": "float",
-            "default": 30.0
-          }
+        "type": "dict",
+        "items": {},
+        "hint": "自由键值映射（api_base / api_key / model / dim / timeout）。使用 dict 而非嵌套 object，避免旧版配置弹窗递归渲染异常；密钥字段在原生配置页与记忆面板均按掩码显示。",
+        "default": {
+          "api_base": "",
+          "api_key": "",
+          "model": "BAAI/bge-m3",
+          "dim": 1024,
+          "timeout": 30.0
         }
       },
       "rerank": {
         "description": "Rerank 模型",
-        "type": "object",
-        "items": {
-          "api_base": {
-            "description": "API 地址",
-            "type": "string",
-            "default": ""
-          },
-          "api_key": {
-            "description": "API 密钥",
-            "type": "string",
-            "default": ""
-          },
-          "model": {
-            "description": "模型名称",
-            "type": "string",
-            "default": "BAAI/bge-reranker-v2-m3"
-          },
-          "timeout": {
-            "description": "请求超时(秒)",
-            "type": "float",
-            "default": 20.0
-          },
-          "rrf_k": {
-            "description": "RRF 常数 k",
-            "type": "int",
-            "default": 60
-          }
+        "type": "dict",
+        "items": {},
+        "hint": "自由键值映射（api_base / api_key / model / timeout / rrf_k）。",
+        "default": {
+          "api_base": "",
+          "api_key": "",
+          "model": "BAAI/bge-reranker-v2-m3",
+          "timeout": 20.0,
+          "rrf_k": 60
         }
       }
     }

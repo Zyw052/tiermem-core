@@ -1,0 +1,17 @@
+{
+  "metadata": {
+    "display_name": "TierMem Core · 分层记忆内核",
+    "short_desc": "L1/L2/L3 分层长期记忆与记忆面板",
+    "desc": "零容器轻量分层长期记忆内核，内置记忆面板 WebUI。"
+  },
+  "views": {
+    "dashboard": {
+      "title": "记忆面板",
+      "description": "通电自检、配置在线保存、记忆浏览、图谱与 DLQ 运维",
+      "subtitle": "分层记忆 · 通电自检 / 配置在线保存 / 记忆浏览 / 图谱 / 维护",
+      "refresh": "刷新",
+      "save": "保存配置",
+      "reload": "重新载入"
+    }
+  }
+}

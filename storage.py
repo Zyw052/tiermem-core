@@ -1984,6 +1984,271 @@ class MemoryStorage:
             logger.error("list_dlq 失败: %s", exc, exc_info=True)
         return result
 
+    # ------------------------------------------------------------------
+    # WebUI 写操作：记忆编辑 / 删除 / 图谱查看
+    # 全部使用参数化 SQL + 事务 + 列名白名单；任何失败返回结构化错误，不抛异常。
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _public_row(row: sqlite3.Row, allowed: Optional[set] = None) -> Dict[str, Any]:
+        """把 sqlite 行转为可 JSON 序列化的 dict；跳过 bytes 与未白名单列。"""
+        try:
+            keys = set(row.keys())
+        except Exception:
+            return {}
+        out: Dict[str, Any] = {}
+        for key in keys:
+            if allowed is not None and key not in allowed:
+                continue
+            try:
+                value = row[key]
+            except Exception:
+                continue
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                continue  # 二进制向量等绝不外泄给 WebUI
+            if isinstance(value, (str, int, float)) or value is None:
+                out[str(key)] = value
+            else:
+                out[str(key)] = str(value)
+        return out
+
+    def update_memory(
+        self,
+        atom_id: str,
+        content: Any = None,
+        importance: Any = None,
+        key_facts: Any = None,
+        topics: Any = None,
+    ) -> Dict[str, Any]:
+        """
+        编辑单条 L2 记忆（正文 / 重要度 / 关键事实 / 主题）。
+
+        :return: ``{"found": bool, "atom_id": str, "updated": [...], "error": str}``
+        """
+        aid = str(atom_id or "").strip()
+        result: Dict[str, Any] = {"found": False, "atom_id": aid, "updated": [], "error": ""}
+        if not aid:
+            result["error"] = "atom_id 为空"
+            return result
+        if len(aid) > 256:
+            result["error"] = "atom_id 过长"
+            return result
+
+        # --- 输入校验（拒绝超长 / 非法类型 / 越界数值） ---
+        new_content: Optional[str] = None
+        if content is not None:
+            if not isinstance(content, str) or not content.strip():
+                result["error"] = "content 必须是非空字符串"
+                return result
+            new_content = content.strip()
+            if len(new_content) > 20000:
+                result["error"] = "content 过长（上限 20000 字符）"
+                return result
+
+        new_importance: Optional[float] = None
+        if importance is not None:
+            try:
+                new_importance = float(importance)
+            except (TypeError, ValueError):
+                result["error"] = "importance 必须是数值"
+                return result
+            if not (0.0 <= new_importance <= 1.0):
+                result["error"] = "importance 必须在 0~1 之间"
+                return result
+
+        def _normalize_list(raw: Any, label: str) -> Optional[List[str]]:
+            if raw is None:
+                return None
+            if not isinstance(raw, list):
+                raise ValueError(f"{label} 必须是数组")
+            items = [str(x).strip() for x in raw if x is not None]
+            if len(items) > 50 or any(len(x) > 500 for x in items):
+                raise ValueError(f"{label} 条目过多或过长")
+            return items
+
+        try:
+            new_facts = _normalize_list(key_facts, "key_facts")
+            new_topics = _normalize_list(topics, "topics")
+        except ValueError as exc:
+            result["error"] = str(exc)
+            return result
+
+        try:
+            conn = self.connect()
+            cols = self._atom_columns(conn)
+            exists = conn.execute(
+                "SELECT 1 FROM l2_atoms WHERE atom_id = ?", (aid,)
+            ).fetchone()
+            if exists is None:
+                result["error"] = "记忆不存在"
+                return result
+
+            sets: List[str] = []
+            params: List[Any] = []
+            if new_content is not None:
+                sets.append("content = ?")
+                params.append(new_content)
+                result["updated"].append("content")
+            if new_importance is not None and "importance" in cols:
+                sets.append("importance = ?")
+                params.append(new_importance)
+                result["updated"].append("importance")
+            if new_facts is not None and "key_facts_json" in cols:
+                sets.append("key_facts_json = ?")
+                params.append(json.dumps(new_facts, ensure_ascii=False))
+                result["updated"].append("key_facts")
+            if new_topics is not None and "topics_json" in cols:
+                sets.append("topics_json = ?")
+                params.append(json.dumps(new_topics, ensure_ascii=False))
+                result["updated"].append("topics")
+            if "updated_at" in cols:
+                sets.append("updated_at = ?")
+                params.append(time.time())
+            if not sets:
+                result["error"] = "没有可更新的字段"
+                return result
+
+            # 列名来自固定白名单，字段名不含用户输入；值全部参数化
+            with conn:
+                conn.execute(
+                    "UPDATE l2_atoms SET " + ", ".join(sets) + " WHERE atom_id = ?",
+                    params + [aid],
+                )
+
+            # 增量同步 FTS 预分词文本（失败不影响主更新）
+            if new_content is not None:
+                try:
+                    self.sync_atom_fts(aid, new_content, new_facts)
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("[MemoryStorage] 编辑后同步 FTS 失败（忽略）: %s", exc)
+            # 正文变化会使旧向量失效，清掉该条向量缓存
+            if new_content is not None:
+                try:
+                    cache = getattr(self, "embedding_cache", None)
+                    if cache is not None and hasattr(cache, "invalidate"):
+                        cache.invalidate(aid)
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("[MemoryStorage] 失效向量缓存失败（忽略）: %s", exc)
+            result["found"] = True
+        except Exception as exc:
+            logger.error("update_memory 失败 (atom_id=%s): %s", aid, exc, exc_info=True)
+            result["error"] = str(exc)
+        return result
+
+    def delete_memory(self, atom_id: str) -> Dict[str, Any]:
+        """
+        删除单条 L2 记忆，并级联清理关联图谱边 / FTS 行 / 向量缓存。
+
+        :return: ``{"found": bool, "atom_id": str, "deleted": {...}, "error": str}``
+        """
+        aid = str(atom_id or "").strip()
+        result: Dict[str, Any] = {
+            "found": False, "atom_id": aid,
+            "deleted": {"atom": 0, "kg_edges": 0}, "error": "",
+        }
+        if not aid or len(aid) > 256:
+            result["error"] = "atom_id 非法"
+            return result
+        try:
+            conn = self.connect()
+            exists = conn.execute(
+                "SELECT 1 FROM l2_atoms WHERE atom_id = ?", (aid,)
+            ).fetchone()
+            if exists is None:
+                result["error"] = "记忆不存在"
+                return result
+            with conn:
+                # 1) 图谱关系边（按来源原子删除，表不存在时忽略）
+                try:
+                    cur = conn.execute(
+                        "DELETE FROM kg_edges WHERE atom_id = ?", (aid,)
+                    )
+                    result["deleted"]["kg_edges"] = int(cur.rowcount or 0)
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("[MemoryStorage] 清理 kg_edges 失败（忽略）: %s", exc)
+                # 2) 主表
+                cur = conn.execute(
+                    "DELETE FROM l2_atoms WHERE atom_id = ?", (aid,)
+                )
+                result["deleted"]["atom"] = int(cur.rowcount or 0)
+                # 3) FTS 倒排表（外部内容表可能不支持 DELETE，容错）
+                try:
+                    conn.execute(
+                        f"DELETE FROM {FTS_TABLE_NAME} WHERE atom_id = ?", (aid,)
+                    )
+                except Exception as exc:  # pragma: no cover
+                    logger.debug("[MemoryStorage] 清理 FTS 行失败（忽略）: %s", exc)
+            try:
+                cache = getattr(self, "embedding_cache", None)
+                if cache is not None and hasattr(cache, "invalidate"):
+                    cache.invalidate(aid)
+            except Exception as exc:  # pragma: no cover
+                logger.debug("[MemoryStorage] 失效向量缓存失败（忽略）: %s", exc)
+            result["found"] = True
+        except Exception as exc:
+            logger.error("delete_memory 失败 (atom_id=%s): %s", aid, exc, exc_info=True)
+            result["error"] = str(exc)
+        return result
+
+    def list_kg_graph(self, limit: int = 100, query: str = "") -> Dict[str, Any]:
+        """
+        知识图谱（L3）节点与关系浏览，供 WebUI「图谱」页签使用。
+
+        使用 ``SELECT *`` + 列名白名单，兼容旧库缺列；bytes 字段一律不外泄。
+        """
+        try:
+            lim = max(1, min(int(limit), 300))
+        except (TypeError, ValueError):
+            lim = 100
+        term = str(query or "").strip()[:200]
+        like = f"%{term}%"
+        payload: Dict[str, Any] = {
+            "nodes": [], "edges": [], "stats": {}, "limit": lim, "query": term,
+        }
+        try:
+            conn = self.connect()
+            node_sql = "SELECT * FROM kg_nodes"
+            node_params: List[Any] = []
+            if term:
+                node_sql += " WHERE COALESCE(entity_name, '') LIKE ?"
+                node_params.append(like)
+            node_sql += " ORDER BY created_at DESC LIMIT ?"
+            node_params.append(lim)
+            nodes = [
+                self._public_row(r)
+                for r in conn.execute(node_sql, node_params).fetchall()
+            ]
+            payload["nodes"] = nodes
+
+            name_of = {
+                str(n.get("node_id")): str(
+                    n.get("entity_name") or n.get("name") or n.get("node_id") or ""
+                )
+                for n in nodes
+            }
+            edge_sql = "SELECT * FROM kg_edges"
+            edge_params: List[Any] = []
+            if term:
+                edge_sql += (
+                    " WHERE COALESCE(relation_type, '') LIKE ?"
+                    " OR COALESCE(atom_id, '') LIKE ?"
+                )
+                edge_params.extend([like, like])
+            edge_sql += " LIMIT ?"
+            edge_params.append(lim * 2)
+            edges = []
+            for row in conn.execute(edge_sql, edge_params).fetchall():
+                item = self._public_row(row)
+                src = str(item.get("source_node_id") or "")
+                dst = str(item.get("target_node_id") or "")
+                item["head"] = name_of.get(src, src)
+                item["tail"] = name_of.get(dst, dst)
+                edges.append(item)
+            payload["edges"] = edges
+            payload["stats"] = self.get_kg_stats()
+        except Exception as exc:
+            logger.error("list_kg_graph 失败: %s", exc, exc_info=True)
+        return payload
+
     def close(self) -> None:
         """安全关闭数据库连接（同时释放向量矩阵缓存，避免句柄/内存残留）"""
         # 方案 B-2：关闭前释放矩阵缓存，避免热重载后持有过期数据

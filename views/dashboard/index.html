@@ -149,16 +149,20 @@
   <body>
     <header>
       <h1>Agent Memory</h1>
-      <span class="sub">分层记忆 · 通电自检 / 记忆浏览 / 噪声排查</span>
+      <span class="sub">分层记忆 · 通电自检 / 配置在线保存 / 记忆浏览 / 图谱 / 维护</span>
       <span class="spacer"></span>
       <button id="btn-refresh">刷新</button>
     </header>
 
     <nav class="tabs">
       <button data-tab="overview" class="active">总览</button>
+      <button data-tab="config">配置</button>
       <button data-tab="providers">服务商</button>
       <button data-tab="memories">记忆</button>
+      <button data-tab="recall">召回测试</button>
+      <button data-tab="graph">图谱</button>
       <button data-tab="noise">噪声 / DLQ</button>
+      <button data-tab="maintenance">维护</button>
     </nav>
 
     <!-- ==================== 总览 ==================== -->
@@ -267,6 +271,123 @@
       </div>
     </section>
 
+    <!-- ==================== 配置（在线查看 / 保存） ==================== -->
+    <section class="tab" id="tab-config">
+      <div class="card">
+        <h2>插件配置 · 在线编辑</h2>
+        <p class="hint">
+          敏感字段（API Key / Token / Secret）以 <span class="mono">******</span> 掩码显示，
+          保持掩码即不修改；留空表示清空。保存后原子写入插件配置文件并热更新运行时，
+          <strong>面板不会自动重载或重启 AstrBot</strong>；配置名前缀标为「需重载」的项，
+          请在插件页手动重载后完全生效。此通道独立于 AstrBot 原生配置弹窗。
+        </p>
+        <div class="row" style="margin: 10px 0">
+          <button class="primary" id="btn-save-config">保存配置</button>
+          <button id="btn-reload-config">重新载入</button>
+          <span class="hint" id="config-result"></span>
+        </div>
+        <div id="config-form"></div>
+      </div>
+    </section>
+
+    <!-- ==================== 召回测试 ==================== -->
+    <section class="tab" id="tab-recall">
+      <div class="card">
+        <h2>手动召回测试</h2>
+        <p class="hint">观察置顶 L3 / 精排 L2 命中与最终注入块，便于排查检索降级。</p>
+        <div class="row" style="margin-bottom: 10px">
+          <input type="search" id="recall-q" placeholder="输入查询词…" />
+          <button class="primary" id="btn-recall">召回</button>
+        </div>
+        <div id="recall-result"></div>
+      </div>
+    </section>
+
+    <!-- ==================== 知识图谱 ==================== -->
+    <section class="tab" id="tab-graph">
+      <div class="card">
+        <h2>知识图谱（L3）</h2>
+        <div class="row" style="margin-bottom: 8px">
+          <input type="search" id="graph-q" placeholder="按实体名 / 关系过滤…" />
+          <button class="primary" id="btn-graph-search">查询</button>
+          <span class="hint" id="graph-stats"></span>
+        </div>
+        <div class="grid cols-2" style="margin-top: 10px">
+          <div>
+            <h2>节点</h2>
+            <ul class="list" id="graph-nodes"></ul>
+          </div>
+          <div>
+            <h2>关系</h2>
+            <ul class="list" id="graph-edges"></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 维护 / 连通性 ==================== -->
+    <section class="tab" id="tab-maintenance">
+      <div class="card">
+        <h2>迁移与维护</h2>
+        <p class="hint">全部操作幂等；迁移预览为只读 dry-run，不会写目标库。</p>
+        <div class="row">
+          <button id="btn-maint-flush">冲洗缓冲</button>
+          <button id="btn-maint-fts">重建 FTS 索引</button>
+          <button id="btn-maint-dlq">重试死信</button>
+          <button id="btn-maint-migrate">迁移预览（只读）</button>
+        </div>
+        <pre class="snippet" id="maint-result">选择上方操作后显示结果。</pre>
+      </div>
+      <div class="card" style="margin-top: 12px">
+        <h2>服务商连通性测试</h2>
+        <p class="hint">真实轻量调用（10 秒超时），只返回维度 / 条数 / 耗时，绝不回传密钥。</p>
+        <div class="row">
+          <select id="test-kind">
+            <option value="embedding">Embedding</option>
+            <option value="rerank">Rerank</option>
+            <option value="chat_completion">对话 LLM</option>
+          </select>
+          <input type="text" id="test-provider" placeholder="provider_id（留空自动挑选）" />
+          <button class="primary" id="btn-test-provider">测试</button>
+        </div>
+        <pre class="snippet" id="test-result">尚未测试。</pre>
+      </div>
+      <div class="card" style="margin-top: 12px">
+        <h2>死信队列概览</h2>
+        <div id="maint-dlq" class="row"></div>
+      </div>
+    </section>
+
+    <!-- 记忆详情 / 编辑弹窗（内容全部经 esc() 转义后再写入 DOM） -->
+    <div id="mem-modal" style="display:none; position:fixed; inset:0; z-index:50; align-items:center; justify-content:center; background:rgba(0,0,0,.45);">
+      <div class="card" style="max-width:720px; width:92%; max-height:86vh; overflow:auto;">
+        <div class="row" style="justify-content: space-between">
+          <h2 style="margin:0">记忆详情 / 编辑</h2>
+          <button class="tiny" id="btn-mem-modal-close">关闭</button>
+        </div>
+        <div id="mem-detail-meta" class="hint mono" style="margin:8px 0"></div>
+        <label class="hint">正文</label>
+        <textarea id="mem-edit-content" rows="7" style="width:100%; box-sizing:border-box; font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:8px;"></textarea>
+        <div class="row" style="margin-top:8px">
+          <label class="hint" style="width:92px">重要度 0~1</label>
+          <input type="text" id="mem-edit-importance" style="width:100px" />
+          <label class="hint" style="width:70px">关键事实</label>
+          <input type="text" id="mem-edit-facts" placeholder="用 / 分隔" style="flex:1; min-width:150px" />
+        </div>
+        <div class="row" style="margin-top:8px">
+          <label class="hint" style="width:92px">主题</label>
+          <input type="text" id="mem-edit-topics" placeholder="用 / 分隔" style="flex:1; min-width:150px" />
+        </div>
+        <div id="mem-detail-triples" class="hint" style="margin-top:10px"></div>
+        <div class="sep"></div>
+        <div class="row">
+          <button class="primary" id="btn-mem-save">保存修改</button>
+          <button id="btn-mem-delete" style="color:var(--bad)">删除记忆</button>
+          <span class="hint" id="mem-modal-result"></span>
+        </div>
+      </div>
+    </div>
+
     <div class="toast" id="toast"></div>
 
     <script>
@@ -316,23 +437,22 @@
         );
       }
 
-      /** 统一 GET：返回 data 或抛错（错误消息直接可读） */
+      /**
+       * 依据《插件可视化视图》(guides/plugin-pages.md)「Bridge API / 请求和返回值规则」：
+       * 宿主 Dashboard 会把后端 {"status":"ok","data":value} 自动解包为 value，
+       * 并把 {"status":"error","message":...} 或 HTTP 失败 reject 成 Error。
+       * 因此这里必须「直接返回 bridge 结果」，禁止再检查响应外壳的 status
+       * 字段、也禁止再次取 data，否则所有成功响应都会被误判为「请求失败」，
+       * 配置表单 / 统计 / 保存链路全部失效。
+       */
       async function apiGet(endpoint, params) {
         if (!VIEW) throw new Error("插件桥接未加载，请刷新页面");
-        const res = await VIEW.apiGet(endpoint, params || {});
-        if (!res || res.status !== "ok") {
-          throw new Error((res && res.message) || "请求失败");
-        }
-        return res.data;
+        return await VIEW.apiGet(endpoint, params || {});
       }
 
       async function apiPost(endpoint, body) {
         if (!VIEW) throw new Error("插件桥接未加载，请刷新页面");
-        const res = await VIEW.apiPost(endpoint, body || {});
-        if (!res || res.status !== "ok") {
-          throw new Error((res && res.message) || "请求失败");
-        }
-        return res.data;
+        return await VIEW.apiPost(endpoint, body || {});
       }
 
       function badge(active, onText, offText) {
@@ -552,6 +672,7 @@
               '<span class="muted">重要性 ' + esc(Number(item.importance || 0).toFixed(2)) + "</span>" +
               '<span class="muted">' + esc(fmtTime(item.created_at)) + "</span>" +
               '<span style="flex:1"></span>' +
+              '<button class="tiny" data-detail="' + esc(item.atom_id) + '">详情 / 编辑</button>' +
               '<button class="tiny" data-pin="' + esc(item.atom_id) + '" data-next="' +
               (item.pinned ? "0" : "1") + '">' + (item.pinned ? "取消置顶" : "置顶") + "</button>" +
               "</div>" +
@@ -668,13 +789,363 @@
       }
 
       // ---------------------------------------------------------------------
+      // 配置：按 schema 动态渲染表单 + 在线保存
+      // 所有服务端返回内容一律经 esc() 后才拼进 innerHTML，杜绝 XSS。
+      // ---------------------------------------------------------------------
+      let configSnapshot = null;
+
+      function isSensitivePath(path) {
+        return !!(configSnapshot && configSnapshot.sensitiveSet &&
+          configSnapshot.sensitiveSet[path]);
+      }
+
+      function fieldInput(path, meta, value) {
+        const type = meta.type || "string";
+        const sensitive = isSensitivePath(path);
+        const common = 'data-cfg-path="' + esc(path) + '" data-cfg-type="' + esc(type) + '"';
+        if (type === "bool") {
+          return '<input type="checkbox" ' + common + (value ? " checked" : "") + " />";
+        }
+        if (type === "int" || type === "float") {
+          const slider = meta.slider || {};
+          const attrs = [
+            slider.min !== undefined ? 'min="' + esc(slider.min) + '"' : "",
+            slider.max !== undefined ? 'max="' + esc(slider.max) + '"' : "",
+            'step="' + esc(slider.step !== undefined ? slider.step : (type === "int" ? 1 : "any")) + '"',
+          ].join(" ");
+          return '<input type="number" ' + common + " " + attrs +
+            ' value="' + esc(value) + '" style="width:170px" />';
+        }
+        if (Array.isArray(meta.options) && meta.options.length) {
+          const opts = meta.options.map((o) =>
+            '<option value="' + esc(o) + '"' +
+            (String(value) === String(o) ? " selected" : "") + ">" + esc(o) + "</option>"
+          ).join("");
+          return "<select " + common + ">" + opts + "</select>";
+        }
+        if (type === "text") {
+          return '<textarea rows="3" ' + common +
+            ' style="width:100%; box-sizing:border-box">' + esc(value) + "</textarea>";
+        }
+        if (type === "dict") {
+          const obj = (value && typeof value === "object") ? value : {};
+          const keys = Object.keys(obj);
+          if (!keys.length) return '<span class="hint">（空）</span>';
+          return keys.map((k) => {
+            const subPath = path + "." + k;
+            const subSensitive = isSensitivePath(subPath);
+            return '<div class="row" style="margin:4px 0">' +
+              '<label class="hint mono" style="width:140px">' + esc(k) + "</label>" +
+              '<input type="' + (subSensitive ? "password" : "text") + '"' +
+              ' data-cfg-path="' + esc(subPath) + '" data-cfg-type="string"' +
+              ' value="' + esc(obj[k]) + '" style="flex:1; min-width:150px" autocomplete="off" /></div>';
+          }).join("");
+        }
+        // 依据《插件配置》(guides/plugin-config.md)「敏感配置项」：
+        // 密钥类字段必须用 type="password" 遮罩；保持掩码值即不修改线上密钥。
+        if (sensitive) {
+          return '<input type="password" ' + common +
+            ' value="' + esc(value) + '" style="width:100%; box-sizing:border-box"' +
+            ' autocomplete="new-password" />' +
+            '<div class="hint">已掩码；保持 ****** 表示不修改</div>';
+        }
+        return '<input type="text" ' + common +
+          ' value="' + esc(value) + '" style="width:100%; box-sizing:border-box"' +
+          ' autocomplete="off" />';
+      }
+
+      function renderSchemaGroup(schema, values, prefix, depth) {
+        let html = "";
+        Object.keys(schema || {}).forEach((key) => {
+          const meta = schema[key] || {};
+          const path = prefix ? prefix + "." + key : key;
+          const type = meta.type || "string";
+          const value = (values || {})[key];
+          if (type === "object") {
+            html += '<div style="margin:12px 0 6px; font-weight:700">' +
+              esc(meta.description || key) +
+              ' <span class="hint mono">' + esc(path) + "</span></div>";
+            if (meta.hint) html += '<div class="hint">' + esc(meta.hint) + "</div>";
+            html += '<div style="padding-left:12px; border-left:2px solid var(--border)">' +
+              renderSchemaGroup(meta.items || {}, value || {}, path, depth + 1) + "</div>";
+            return;
+          }
+          html += '<div class="kv" style="align-items:flex-start; gap:12px; padding:7px 0; border-bottom:1px solid var(--border)">' +
+            '<div style="width:210px; flex-shrink:0"><div>' + esc(meta.description || key) + "</div>" +
+            '<div class="hint mono">' + esc(path) + (meta.invisible ? " · 高级" : "") + "</div></div>" +
+            '<div style="flex:1; min-width:200px">' + fieldInput(path, meta, value) +
+            (meta.hint ? '<div class="hint">' + esc(meta.hint) + "</div>" : "") +
+            "</div></div>";
+        });
+        return html;
+      }
+
+      function setByPath(root, path, value) {
+        const parts = String(path).split(".");
+        let cur = root;
+        for (let i = 0; i < parts.length - 1; i++) {
+          if (!cur[parts[i]] || typeof cur[parts[i]] !== "object") cur[parts[i]] = {};
+          cur = cur[parts[i]];
+        }
+        cur[parts[parts.length - 1]] = value;
+      }
+
+      function collectConfig() {
+        const payload = {};
+        document.querySelectorAll("#config-form [data-cfg-path]").forEach((el) => {
+          const path = el.getAttribute("data-cfg-path");
+          const type = el.getAttribute("data-cfg-type");
+          let value;
+          if (type === "bool") {
+            value = !!el.checked;
+          } else if (type === "int" || type === "float") {
+            const raw = String(el.value || "").trim();
+            if (raw === "") return;
+            value = Number(raw);
+            if (Number.isNaN(value)) return;
+          } else {
+            value = el.value;
+          }
+          setByPath(payload, path, value);
+        });
+        return payload;
+      }
+
+      async function loadConfig() {
+        try {
+          const data = await apiGet("page/config");
+          configSnapshot = data || {};
+          const set = {};
+          (configSnapshot.sensitive_paths || []).forEach((p) => { set[p] = true; });
+          configSnapshot.sensitiveSet = set;
+          $("#config-form").innerHTML = renderSchemaGroup(
+            configSnapshot.schema || {}, configSnapshot.values || {}, "", 0
+          );
+          $("#config-result").textContent = "配置文件 " +
+            (configSnapshot.config_file || "-") + " · 更新时间 " +
+            (configSnapshot.updated_at ? fmtTime(configSnapshot.updated_at) : "-");
+        } catch (e) {
+          // 链路异常时给出可读占位，避免「配置区空白」被误认为没有保存按钮。
+          configSnapshot = null;
+          $("#config-form").innerHTML =
+            '<div class="empty">配置载入失败：' + esc(e.message) +
+            '（请点击「重新载入」重试）</div>';
+          $("#config-result").textContent = "";
+          throw e;
+        }
+      }
+
+      async function saveConfig() {
+        if (!configSnapshot) { toast("配置尚未载入，请先点「重新载入」", "err"); return; }
+        const payload = collectConfig();
+        const btn = $("#btn-save-config");
+        if (btn) btn.disabled = true;
+        $("#config-result").textContent = "保存中…";
+        try {
+          const data = await apiPost("page/config/save", { config: payload });
+          const changed = (data.changed || []).length;
+          toast(data.note || "配置已保存", "ok");
+          await loadConfig();
+          await loadOverview().catch(() => {});
+          $("#config-result").textContent = "已保存 " + changed + " 项变更" +
+            (data.requires_reload ? "（部分项需重载插件后完全生效）" : "（已即时生效）");
+        } catch (e) {
+          $("#config-result").textContent = "";
+          toast("保存失败：" + e.message, "err");
+        } finally {
+          if (btn) btn.disabled = false;
+        }
+      }
+
+      // ---------------------------------------------------------------------
+      // 召回测试（接通后端 page/recall）
+      // ---------------------------------------------------------------------
+      function recallItemsHtml(items) {
+        const list = Array.isArray(items) ? items : [];
+        if (!list.length) return '<div class="empty">无</div>';
+        return '<ul class="list">' + list.map((x) => {
+          const text = typeof x === "string" ? x :
+            (x && typeof x === "object" ? (x.content || x.text || JSON.stringify(x)) : String(x));
+          return "<li><div class=\"mem-body\">" + esc(text) + "</div></li>";
+        }).join("") + "</ul>";
+      }
+
+      async function runRecall() {
+        const q = $("#recall-q").value.trim();
+        if (!q) { toast("请输入查询词", "err"); return; }
+        $("#recall-result").innerHTML = '<div class="empty">检索中…</div>';
+        try {
+          const data = await apiGet("page/recall", { q: q, top_k: 6 });
+          const pinned = data.pinned_l3 || [];
+          const retrieved = data.retrieved_l2 || [];
+          let html = '<div class="hint">' + esc(data.elapsed_ms) + " ms · 置顶 " +
+            pinned.length + " 条 / 召回 " + retrieved.length + " 条</div>";
+          html += "<h2>置顶 L3</h2>" + recallItemsHtml(pinned);
+          html += "<h2>召回 L2</h2>" + recallItemsHtml(retrieved);
+          html += "<h2>最终注入块</h2><pre class=\"snippet\">" +
+            esc(data.prompt_block || "（空）") + "</pre>";
+          $("#recall-result").innerHTML = html;
+        } catch (e) {
+          $("#recall-result").innerHTML = "";
+          toast("召回失败：" + e.message, "err");
+        }
+      }
+
+      // ---------------------------------------------------------------------
+      // 知识图谱（接通后端 page/graph）
+      // ---------------------------------------------------------------------
+      async function loadGraph() {
+        const q = $("#graph-q").value.trim();
+        const data = await apiGet("page/graph", { q: q, limit: 100 });
+        const stats = data.stats || {};
+        $("#graph-stats").textContent = "节点 " + (stats.nodes || 0) + " · 边 " +
+          (stats.edges || 0) + " · 活跃 " + (stats.active_edges || 0);
+        const nodes = data.nodes || [];
+        $("#graph-nodes").innerHTML = nodes.length
+          ? nodes.map((n) => "<li><span class=\"mono\">" +
+              esc(n.entity_name || n.name || n.node_id || "") + "</span>" +
+              (n.entity_type ? ' <span class="badge ok">' + esc(n.entity_type) + "</span>" : "") +
+              "</li>").join("")
+          : '<div class="empty">暂无节点</div>';
+        const edges = data.edges || [];
+        $("#graph-edges").innerHTML = edges.length
+          ? edges.map((e) => "<li><div class=\"mem-head\">" +
+              '<span class="mono">' + esc(e.head || "") + "</span>" +
+              '<span class="badge ok">' + esc(e.relation_type || e.relation || "") + "</span>" +
+              '<span class="mono">' + esc(e.tail || "") + "</span></div>" +
+              '<div class="hint">' + esc(e.status || "") + " · 置信度 " +
+              esc(Number(e.confidence || 0).toFixed(2)) + "</div></li>").join("")
+          : '<div class="empty">暂无关系</div>';
+      }
+
+      // ---------------------------------------------------------------------
+      // 维护 / 服务商连通性测试
+      // ---------------------------------------------------------------------
+      async function loadMaintenance() {
+        try {
+          const data = await apiGet("page/dlq", { limit: 1 });
+          const counts = data.counts || {};
+          $("#maint-dlq").innerHTML = Object.keys(counts).length
+            ? Object.entries(counts).map(([k, v]) =>
+                '<span class="badge warn">' + esc(k) + ": " + esc(v) + "</span>").join("")
+            : '<span class="hint">队列为空</span>';
+        } catch (e) {
+          toast("读取 DLQ 失败：" + e.message, "err");
+        }
+      }
+
+      async function runMaintenance(op) {
+        $("#maint-result").textContent = "执行中…";
+        try {
+          const data = await apiPost("page/maintenance", { op: op });
+          $("#maint-result").textContent = JSON.stringify(data, null, 2);
+          toast("维护操作完成", "ok");
+          await loadMaintenance();
+        } catch (e) {
+          $("#maint-result").textContent = "";
+          toast("操作失败：" + e.message, "err");
+        }
+      }
+
+      async function runProviderTest() {
+        $("#test-result").textContent = "测试中（最多 10 秒）…";
+        try {
+          const data = await apiPost("page/providers/test", {
+            kind: $("#test-kind").value,
+            provider_id: $("#test-provider").value.trim(),
+          });
+          $("#test-result").textContent = JSON.stringify(data, null, 2);
+          toast("连通性测试完成", "ok");
+        } catch (e) {
+          $("#test-result").textContent = "";
+          toast("测试失败：" + e.message, "err");
+        }
+      }
+
+      // ---------------------------------------------------------------------
+      // 记忆详情 / 编辑 / 删除（接通后端 memory/<id> 与新增写接口）
+      // ---------------------------------------------------------------------
+      let currentAtomId = "";
+
+      function showModal(show) {
+        $("#mem-modal").style.display = show ? "flex" : "none";
+      }
+
+      async function openMemoryDetail(atomId) {
+        try {
+          const data = await apiGet("page/memory/" + encodeURIComponent(atomId));
+          currentAtomId = atomId;
+          $("#mem-detail-meta").textContent = "ID: " + (data.atom_id || atomId) +
+            " · scope: " + (data.scope_key || "-") + " · tier: " + (data.tier || "-");
+          $("#mem-edit-content").value = data.content || "";
+          $("#mem-edit-importance").value =
+            data.importance !== undefined ? data.importance : "";
+          $("#mem-edit-facts").value = (data.key_facts || []).join(" / ");
+          $("#mem-edit-topics").value = (data.topics || []).join(" / ");
+          const triples = data.triples || [];
+          $("#mem-detail-triples").innerHTML = triples.length
+            ? "关联三元组：<br>" + triples.map((t) =>
+                esc(t.head) + " — " + esc(t.relation) + " → " + esc(t.tail)
+              ).join("<br>")
+            : "无关联三元组";
+          $("#mem-modal-result").textContent = "";
+          showModal(true);
+        } catch (e) {
+          toast("读取详情失败：" + e.message, "err");
+        }
+      }
+
+      async function saveMemoryEdit() {
+        if (!currentAtomId) return;
+        const body = {
+          atom_id: currentAtomId,
+          content: $("#mem-edit-content").value,
+          key_facts: $("#mem-edit-facts").value.split("/").map((s) => s.trim()).filter(Boolean),
+          topics: $("#mem-edit-topics").value.split("/").map((s) => s.trim()).filter(Boolean),
+        };
+        const imp = parseFloat(String($("#mem-edit-importance").value).trim());
+        if (!Number.isNaN(imp)) body.importance = imp;
+        try {
+          await apiPost("page/memories/edit", body);
+          toast("记忆已更新", "ok");
+          showModal(false);
+          await loadMemories();
+        } catch (e) {
+          $("#mem-modal-result").textContent = "保存失败：" + e.message;
+          toast("保存失败：" + e.message, "err");
+        }
+      }
+
+      async function deleteMemory() {
+        if (!currentAtomId) return;
+        if (!window.confirm(
+          "确认删除记忆 " + currentAtomId + "？\n此操作会同时删除关联图谱边，且不可撤销。"
+        )) return;
+        try {
+          await apiPost("page/memories/delete", {
+            atom_id: currentAtomId, confirm: true,
+          });
+          toast("记忆已删除", "ok");
+          showModal(false);
+          await loadMemories();
+        } catch (e) {
+          toast("删除失败：" + e.message, "err");
+        }
+      }
+
+      // ---------------------------------------------------------------------
       // 交互装配
       // ---------------------------------------------------------------------
       const loaders = {
         overview: loadOverview,
+        config: loadConfig,
         providers: loadProviders,
         memories: loadMemories,
+        // 召回测试需要用户输入查询词，切到该页签时不自动发请求
+        recall: () => Promise.resolve(),
+        graph: loadGraph,
         noise: loadNoise,
+        maintenance: loadMaintenance,
       };
 
       function activate(name) {
@@ -732,11 +1203,82 @@
           loadMemories().catch((e) => toast(e.message, "err"));
         });
 
-        // 事件委托：置顶按钮（内容由服务端返回，必须转义后再插入 DOM）
+        // 配置保存 / 重新载入
+        $("#btn-save-config").addEventListener("click", () => saveConfig());
+        $("#btn-reload-config").addEventListener("click", () => {
+          loadConfig()
+            .then(() => toast("已重新载入", "ok"))
+            .catch((e) => toast("载入失败：" + e.message, "err"));
+        });
+
+        // 召回测试
+        $("#btn-recall").addEventListener("click", () => runRecall());
+        $("#recall-q").addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") $("#btn-recall").click();
+        });
+
+        // 图谱
+        $("#btn-graph-search").addEventListener("click", () => {
+          loadGraph().catch((e) => toast("图谱加载失败：" + e.message, "err"));
+        });
+        $("#graph-q").addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") $("#btn-graph-search").click();
+        });
+
+        // 维护 + 服务商连通性测试
+        const maintButtons = {
+          "btn-maint-flush": "flush",
+          "btn-maint-fts": "rebuild_fts",
+          "btn-maint-dlq": "retry_dlq",
+          "btn-maint-migrate": "migrate_preview",
+        };
+        Object.keys(maintButtons).forEach((id) => {
+          $("#" + id).addEventListener("click", () => runMaintenance(maintButtons[id]));
+        });
+        $("#btn-test-provider").addEventListener("click", () => runProviderTest());
+
+        // 记忆详情弹窗
+        $("#btn-mem-modal-close").addEventListener("click", () => showModal(false));
+        $("#mem-modal").addEventListener("click", (ev) => {
+          if (ev.target && ev.target.id === "mem-modal") showModal(false);
+        });
+        $("#btn-mem-save").addEventListener("click", () => saveMemoryEdit());
+        $("#btn-mem-delete").addEventListener("click", () => deleteMemory());
+
+        // 事件委托：详情 / 置顶按钮（内容由服务端返回，必须转义后再插入 DOM）
         $("#mem-list").addEventListener("click", (ev) => {
+          const detail = ev.target.closest("button[data-detail]");
+          if (detail) {
+            openMemoryDetail(detail.dataset.detail);
+            return;
+          }
           const btn = ev.target.closest("button[data-pin]");
           if (!btn) return;
           togglePin(btn.dataset.pin, btn.dataset.next);
+        });
+      }
+
+      /**
+       * 依据《插件可视化视图》(guides/plugin-pages.md)「上下文」「视图元数据与国际化」：
+       * 页面文案取自 .astrbot-plugin/i18n/<locale>.json 的 views.dashboard.*，
+       * 通过 bridge.t() 读取；onContext() 响应语言 / 亮暗主题切换。
+       */
+      function applyI18n() {
+        if (!VIEW) return;
+        const tr = (key, fallback) =>
+          (typeof VIEW.t === "function" ? VIEW.t(key, fallback) : fallback);
+        document.title = tr("views.dashboard.title", "Agent Memory · 记忆面板");
+        const sub = document.querySelector(".sub");
+        if (sub) sub.textContent = tr("views.dashboard.subtitle",
+          "分层记忆 · 通电自检 / 配置在线保存 / 记忆浏览 / 图谱 / 维护");
+        const pairs = [
+          ["#btn-refresh", "views.dashboard.refresh", "刷新"],
+          ["#btn-save-config", "views.dashboard.save", "保存配置"],
+          ["#btn-reload-config", "views.dashboard.reload", "重新载入"],
+        ];
+        pairs.forEach(([sel, key, fallback]) => {
+          const el = $(sel);
+          if (el) el.textContent = tr(key, fallback);
         });
       }
 
@@ -744,10 +1286,19 @@
       async function boot() {
         if (booted) return;
         booted = true;
-        bindEvents();
+        // 任一控件缺失不应导致整页初始化中断（guides/plugin-pages.md「调试建议」）
+        try {
+          bindEvents();
+        } catch (e) {
+          toast("交互绑定失败：" + e.message, "err");
+        }
         try {
           if (VIEW && typeof VIEW.ready === "function") {
             await VIEW.ready();
+          }
+          applyI18n();
+          if (VIEW && typeof VIEW.onContext === "function") {
+            VIEW.onContext(applyI18n);
           }
         } catch (e) {
           /* 桥接上下文读取失败不阻塞页面 */

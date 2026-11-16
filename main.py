@@ -36,7 +36,7 @@ except Exception:  # pragma: no cover - 仅非 AstrBot 环境触发
 
     logger = logging.getLogger("astrbot_plugin_agent_memory.main")
 
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star  # 依据 §3：主类继承 Star，宿主自动注册
 
 # Stage 2 双向钩子装饰器按可用性接入：
 # - on_llm_request       : LLM 请求前置，可写 req.system_prompt（记忆注入）
@@ -413,13 +413,10 @@ def _make_llm_call(backend: Any):
     return _call
 
 
-@register(
-    PLUGIN_NAME,
-    "Vivian & Master",
-    "智涌原生分层记忆插件 (L1工作区/L2情景/L3画像 + 独立总结模型 + 资产无缝迁移 + 专属WebUI)",
-    "1.0.0",
-    "",
-)
+# 依据 §2「目录与 metadata.yaml」/ §3「main.py」：
+# 插件元数据统一由 metadata.yaml 提供，主类只需继承 Star（宿主自动识别）。
+# 旧式注册装饰器（register_star）自 v3.5.19 起已废弃，且其 version/author 与
+# metadata.yaml 不一致会形成双份元数据，故移除以避免宿主注册信息漂移。
 class AgentMemoryPlugin(Star):
     """智涌原生分层记忆插件主类（Stage 1：多轮缓冲总结 + 组件总装 + 生命周期托管）"""
 
@@ -430,6 +427,10 @@ class AgentMemoryPlugin(Star):
         self.config: Dict[str, Any] = _as_plain(config) if config is not None else {}
         if not isinstance(self.config, dict):  # 极端防御
             self.config = {}
+        # 保留宿主传入的原始配置对象（AstrBotConfig）：记忆面板保存配置时
+        # 需要它的 config_path 写回同一份文件，避免出现「面板保存」与
+        # 「AstrBot 原生配置页」各写一份的漂移。读失败不影响插件主链路。
+        self._host_config: Any = config
 
         self.data_dir: Path = _resolve_plugin_data_dir(PLUGIN_NAME)
         self.enable_memory: bool = bool(self.config.get("enable_memory", True))
@@ -512,6 +513,50 @@ class AgentMemoryPlugin(Star):
         """安全读取配置中的子字典，非 dict 时返回空字典。"""
         value = self.config.get(name)
         return value if isinstance(value, dict) else {}
+
+    def apply_runtime_config(self, new_cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        记忆面板保存配置后的**运行时热更新**（不 reload、不重启主进程）。
+
+        只即时更新可安全热更的开关/参数；检索参数由
+        ``_retrieval_runtime_cfg()`` 每轮从 ``self.config`` 读取，故
+        ``ConfigManager._sync_runtime()`` 更新 ``self.config`` 后即生效。
+        其余（db_path / 模型凭证 / 后台 Worker / 页面路由注册）需插件重载，
+        由面板返回 ``requires_reload`` 提示，绝不在此自动重载。
+
+        :param new_cfg: 已校验并落盘的完整配置
+        :return: ``{"applied": [...], "skipped": [...]}``，任何异常都被吞掉
+        """
+        applied: List[str] = []
+        skipped: List[str] = []
+        cfg = new_cfg if isinstance(new_cfg, dict) else {}
+        try:
+            self.enable_memory = bool(cfg.get("enable_memory", self.enable_memory))
+            applied.append("enable_memory")
+        except Exception as exc:  # pragma: no cover
+            logger.debug("[agent_memory] 热更新 enable_memory 失败（忽略）: %s", exc)
+        try:
+            self.enable_injection = bool(
+                cfg.get("memory_injection_enable", self.enable_injection)
+            )
+            applied.append("enable_injection")
+        except Exception as exc:  # pragma: no cover
+            logger.debug("[agent_memory] 热更新 enable_injection 失败（忽略）: %s", exc)
+        try:
+            self.turn_interval = _safe_int(
+                cfg.get("summary_turn_interval"), self.turn_interval, minimum=1
+            )
+            applied.append("turn_interval")
+        except Exception as exc:  # pragma: no cover
+            logger.debug("[agent_memory] 热更新 turn_interval 失败（忽略）: %s", exc)
+        # 检索/注入参数每次请求都从 self.config 现读，此处仅显式标注已生效
+        for section in ("retrieval", "noise_filter", "graph", "evaluator"):
+            if isinstance(cfg.get(section), dict):
+                applied.append(f"{section}.*")
+        skipped.extend(
+            ["db_path", "summarizer.*", "models.*", "migration.*", "webui.register_api"]
+        )
+        return {"applied": applied, "skipped": skipped}
 
     def _resolve_turn_interval(self) -> int:
         """解析 summary_turn_interval：顶层优先，其次 summarizer 子节点，默认 5。"""

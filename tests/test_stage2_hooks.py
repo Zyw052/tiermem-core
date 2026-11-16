@@ -248,10 +248,15 @@ async def test_hooks_assembled() -> None:
     with tempfile.TemporaryDirectory(prefix="stage2_assembly_") as tmp:
         plugin = make_plugin(Path(tmp))
         try:
-            assert hasattr(plugin.on_llm_request, "__astrbot_hook__"), "前置钩子未装配"
-            assert getattr(plugin.on_llm_request, "__astrbot_hook__") == "on_llm_request"
-            assert hasattr(plugin.on_llm_response, "__astrbot_hook__"), "后置钩子未装配"
-            assert getattr(plugin.on_llm_response, "__astrbot_hook__") == "on_llm_response"
+            # 宿主 v4.29.4 的 register_on_llm_request 只注册 handler 元数据，
+            # 不再在函数上打 __astrbot_hook__ 标记；测试桩包仍会打标记。
+            # 以「可调用 + 标记若有则正确 + status.hooks」三重校验，兼容两种后端。
+            for hook_name in ("on_llm_request", "on_llm_response"):
+                fn = getattr(plugin, hook_name, None)
+                assert callable(fn), f"{hook_name} 未装配"
+                marker = getattr(fn, "__astrbot_hook__", None)
+                if marker is not None:
+                    assert marker == hook_name, f"{hook_name} 装饰器标记错误"
 
             status = plugin.get_status()
             assert status["hooks"]["on_llm_request"] is True
