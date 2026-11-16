@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Agent Memory · 记忆面板</title>
+    <!--
+      宿主会在服务时把这条 script 的地址重写成带 asset_token 的桥接 SDK 地址
+      （见 astrbot/dashboard/services/plugin_page_service.py:process_plugin_page_html）。
+      因此这里必须保留原始路径 /api/plugin/page/bridge-sdk.js。
+    -->
+    <script src="/api/plugin/page/bridge-sdk.js"></script>
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --border: rgba(15, 23, 42, 0.12);
+        --text: #0f172a;
+        --muted: #5b6472;
+        --accent: #2563eb;
+        --ok: #16a34a;
+        --warn: #d97706;
+        --bad: #dc2626;
+        --chip: rgba(37, 99, 235, 0.1);
+      }
+      html[data-theme="dark"] {
+        --bg: #0b1020;
+        --panel: #151b2d;
+        --border: rgba(148, 163, 184, 0.22);
+        --text: #e6ebf5;
+        --muted: #9aa6bd;
+        --accent: #60a5fa;
+        --ok: #4ade80;
+        --warn: #fbbf24;
+        --bad: #f87171;
+        --chip: rgba(96, 165, 250, 0.16);
+      }
+      @media (prefers-color-scheme: dark) {
+        html:not([data-theme="light"]) {
+          --bg: #0b1020;
+          --panel: #151b2d;
+          --border: rgba(148, 163, 184, 0.22);
+          --text: #e6ebf5;
+          --muted: #9aa6bd;
+          --accent: #60a5fa;
+          --ok: #4ade80;
+          --warn: #fbbf24;
+          --bad: #f87171;
+          --chip: rgba(96, 165, 250, 0.16);
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 20px 22px 40px;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      header {
+        display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+        margin-bottom: 16px;
+      }
+      header h1 { font-size: 18px; margin: 0; font-weight: 700; }
+      header .sub { color: var(--muted); font-size: 12px; }
+      header .spacer { flex: 1; }
+      button {
+        font: inherit; cursor: pointer; border-radius: 8px;
+        border: 1px solid var(--border); background: var(--panel);
+        color: var(--text); padding: 6px 12px; transition: 0.15s;
+      }
+      button:hover { border-color: var(--accent); color: var(--accent); }
+      button.primary {
+        background: var(--accent); border-color: var(--accent); color: #fff;
+      }
+      button.primary:hover { opacity: 0.9; color: #fff; }
+      button.tiny { padding: 3px 9px; font-size: 12px; }
+      nav.tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+      nav.tabs button.active {
+        background: var(--chip); border-color: var(--accent); color: var(--accent);
+        font-weight: 600;
+      }
+      section.tab { display: none; }
+      section.tab.active { display: block; }
+      .grid { display: grid; gap: 12px; }
+      .grid.cols-4 { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+      .grid.cols-2 { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+      .card {
+        background: var(--panel); border: 1px solid var(--border);
+        border-radius: 12px; padding: 14px 16px;
+      }
+      .card h2 {
+        margin: 0 0 10px; font-size: 13px; font-weight: 700;
+        color: var(--muted); letter-spacing: 0.02em; text-transform: uppercase;
+      }
+      .stat { font-size: 24px; font-weight: 700; line-height: 1.2; }
+      .stat-label { color: var(--muted); font-size: 12px; }
+      .badge {
+        display: inline-block; padding: 2px 8px; border-radius: 999px;
+        font-size: 12px; font-weight: 600; border: 1px solid transparent;
+      }
+      .badge.ok { color: var(--ok); background: rgba(22, 163, 74, 0.12); }
+      .badge.warn { color: var(--warn); background: rgba(217, 119, 6, 0.14); }
+      .badge.bad { color: var(--bad); background: rgba(220, 38, 38, 0.12); }
+      .kv { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; }
+      .kv > span:first-child { color: var(--muted); }
+      .kv > span:last-child { text-align: right; word-break: break-all; }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      input[type="text"], input[type="search"], select {
+        font: inherit; color: var(--text); background: var(--panel);
+        border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
+      }
+      input[type="search"] { min-width: 240px; flex: 1; }
+      select { min-width: 240px; }
+      .muted { color: var(--muted); }
+      .empty { color: var(--muted); padding: 18px 0; text-align: center; }
+      ul.list { list-style: none; margin: 0; padding: 0; }
+      ul.list li {
+        border: 1px solid var(--border); border-radius: 10px;
+        padding: 10px 12px; margin-bottom: 8px; background: var(--panel);
+      }
+      .mem-head {
+        display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+        margin-bottom: 6px;
+      }
+      .mem-body { white-space: pre-wrap; word-break: break-word; }
+      .mem-facts { margin-top: 6px; color: var(--muted); font-size: 12.5px; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+      pre.snippet {
+        margin: 6px 0 0; padding: 8px 10px; border-radius: 8px;
+        background: rgba(127, 127, 127, 0.1); white-space: pre-wrap;
+        word-break: break-word; font-size: 12px; max-height: 180px; overflow: auto;
+      }
+      .toast {
+        position: fixed; right: 20px; bottom: 20px; max-width: 420px;
+        padding: 10px 14px; border-radius: 10px; background: var(--panel);
+        border: 1px solid var(--border); box-shadow: 0 8px 24px rgba(0,0,0,.18);
+        opacity: 0; transform: translateY(8px); transition: .2s; pointer-events: none;
+      }
+      .toast.show { opacity: 1; transform: translateY(0); }
+      .toast.err { border-color: var(--bad); color: var(--bad); }
+      .toast.ok { border-color: var(--ok); }
+      .sep { height: 1px; background: var(--border); margin: 12px 0; }
+      .hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Agent Memory</h1>
+      <span class="sub">分层记忆 · 通电自检 / 记忆浏览 / 噪声排查</span>
+      <span class="spacer"></span>
+      <button id="btn-refresh">刷新</button>
+    </header>
+
+    <nav class="tabs">
+      <button data-tab="overview" class="active">总览</button>
+      <button data-tab="providers">服务商</button>
+      <button data-tab="memories">记忆</button>
+      <button data-tab="noise">噪声 / DLQ</button>
+    </nav>
+
+    <!-- ==================== 总览 ==================== -->
+    <section class="tab active" id="tab-overview">
+      <div class="card" style="margin-bottom: 12px">
+        <h2>通电自检</h2>
+        <div id="degraded-banner" class="hint"></div>
+        <div class="grid cols-4" id="power-grid" style="margin-top: 10px"></div>
+      </div>
+
+      <div class="grid cols-4" id="count-grid"></div>
+
+      <div class="grid cols-2" style="margin-top: 12px">
+        <div class="card">
+          <h2>运行信息</h2>
+          <div id="runtime-info"></div>
+        </div>
+        <div class="card">
+          <h2>引擎细节</h2>
+          <div id="engine-info"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 服务商 ==================== -->
+    <section class="tab" id="tab-providers">
+      <div class="card">
+        <h2>运行期服务商绑定</h2>
+        <p class="hint">
+          下拉来源为 AstrBot 已配置的服务商。绑定结果写入插件数据目录的
+          <span class="mono">provider_bindings.json</span>，不会改动宿主配置；
+          保存后立即热重建客户端生效。
+        </p>
+        <div class="grid" style="margin-top: 10px">
+          <div class="row">
+            <label style="width: 130px" class="muted">总结 / 判官 LLM</label>
+            <select id="sel-chat"></select>
+          </div>
+          <div class="row">
+            <label style="width: 130px" class="muted">Embedding</label>
+            <select id="sel-embedding"></select>
+          </div>
+          <div class="row">
+            <label style="width: 130px" class="muted">Rerank</label>
+            <select id="sel-rerank"></select>
+          </div>
+          <div class="row">
+            <button class="primary" id="btn-save-bindings">保存并热重建</button>
+            <span class="hint" id="bind-result"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 12px">
+        <h2>当前生效配置</h2>
+        <div id="effective-info"></div>
+        <p class="hint">
+          提示：Embedding 维度若发生变化，历史向量与新维度不兼容，
+          需要重建索引后才能得到正确的语义相似度。
+        </p>
+      </div>
+    </section>
+
+    <!-- ==================== 记忆 ==================== -->
+    <section class="tab" id="tab-memories">
+      <div class="card">
+        <h2>记忆浏览 / 搜索</h2>
+        <div class="row" style="margin-bottom: 10px">
+          <input type="search" id="mem-query" placeholder="输入关键词搜索内容或关键事实…" />
+          <label class="row" style="gap: 4px">
+            <input type="checkbox" id="mem-pinned" /> 仅置顶
+          </label>
+          <button class="primary" id="btn-search">搜索</button>
+          <span class="hint" id="mem-summary"></span>
+        </div>
+        <ul class="list" id="mem-list"></ul>
+        <div class="row" style="justify-content: center">
+          <button class="tiny" id="btn-prev">上一页</button>
+          <span class="hint" id="mem-page"></span>
+          <button class="tiny" id="btn-next">下一页</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 噪声 / DLQ ==================== -->
+    <section class="tab" id="tab-noise">
+      <div class="grid cols-2">
+        <div class="card">
+          <h2>噪声过滤统计</h2>
+          <div id="noise-stats"></div>
+          <p class="hint">
+            规则覆盖：子代理后台任务回调、项目大盘、RAG 标记、system_reminder、
+            未闭合系统标签、框架日志行等。
+          </p>
+        </div>
+        <div class="card">
+          <h2>最近被拦截样本</h2>
+          <ul class="list" id="noise-list"></ul>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 12px">
+        <h2>死信队列（失败任务）</h2>
+        <div id="dlq-counts" class="row" style="margin-bottom: 8px"></div>
+        <ul class="list" id="dlq-list"></ul>
+      </div>
+    </section>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+      // ---------------------------------------------------------------------
+      // 桥接 SDK 封装：所有请求都走宿主插件页 bridge（自动带鉴权与 CSRF）
+      // ---------------------------------------------------------------------
+      const VIEW = window.AstrBotPluginView;
+      const state = {
+        page: 0,
+        pageSize: 10,
+        total: 0,
+        query: "",
+        pinnedOnly: false,
+        providers: null,
+        busy: false,
+      };
+
+      const $ = (sel) => document.querySelector(sel);
+
+      function toast(message, kind) {
+        const el = $("#toast");
+        el.textContent = message;
+        el.className = "toast show " + (kind || "ok");
+        clearTimeout(el._t);
+        el._t = setTimeout(() => {
+          el.className = "toast " + (kind || "ok");
+        }, 2600);
+      }
+
+      function esc(value) {
+        return String(value === undefined || value === null ? "" : value)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
+
+      function fmtTime(ts) {
+        if (!ts) return "-";
+        const d = new Date(Number(ts) * 1000);
+        if (Number.isNaN(d.getTime())) return "-";
+        const p = (n) => String(n).padStart(2, "0");
+        return (
+          d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+          " " + p(d.getHours()) + ":" + p(d.getMinutes())
+        );
+      }
+
+      /** 统一 GET：返回 data 或抛错（错误消息直接可读） */
+      async function apiGet(endpoint, params) {
+        if (!VIEW) throw new Error("插件桥接未加载，请刷新页面");
+        const res = await VIEW.apiGet(endpoint, params || {});
+        if (!res || res.status !== "ok") {
+          throw new Error((res && res.message) || "请求失败");
+        }
+        return res.data;
+      }
+
+      async function apiPost(endpoint, body) {
+        if (!VIEW) throw new Error("插件桥接未加载，请刷新页面");
+        const res = await VIEW.apiPost(endpoint, body || {});
+        if (!res || res.status !== "ok") {
+          throw new Error((res && res.message) || "请求失败");
+        }
+        return res.data;
+      }
+
+      function badge(active, onText, offText) {
+        return active
+          ? '<span class="badge ok">' + esc(onText || "已激活") + "</span>"
+          : '<span class="badge warn">' + esc(offText || "降级") + "</span>";
+      }
+
+      // ---------------------------------------------------------------------
+      // 总览
+      // ---------------------------------------------------------------------
+      function renderOverview(data) {
+        const check = (data && data.self_check) || {};
+        const status = (data && data.status) || {};
+        const power = [
+          { key: "embedding", title: "向量化", info: check.embedding },
+          { key: "llm", title: "总结 LLM", info: check.llm },
+          { key: "judge", title: "判官 (jev)", info: check.judge },
+          { key: "kg", title: "知识图谱", info: check.kg },
+        ];
+
+        $("#power-grid").innerHTML = power
+          .map((item) => {
+            const info = item.info || {};
+            const active =
+              item.key === "kg"
+                ? Boolean(info.enabled)
+                : item.key === "judge"
+                ? Boolean(info.present && info.enabled && info.injected_provider)
+                : Boolean(info.powered);
+            const detail =
+              info.provider_id
+                ? "服务商 " + esc(info.provider_id)
+                : info.model
+                ? esc(info.model)
+                : info.mode
+                ? "模式 " + esc(info.mode)
+                : "未配置";
+            return (
+              '<div class="card">' +
+              '<div class="row" style="justify-content: space-between">' +
+              "<strong>" + esc(item.title) + "</strong>" +
+              badge(active, "已通电", "降级中") +
+              "</div>" +
+              '<div class="hint">' + detail + "</div>" +
+              "</div>"
+            );
+          })
+          .join("");
+
+        const degraded = check.degraded || [];
+        const banner = $("#degraded-banner");
+        if (!degraded.length) {
+          banner.innerHTML = '<span class="badge ok">全部组件已激活</span>';
+        } else {
+          banner.innerHTML =
+            '<span class="badge bad">存在 ' + degraded.length + " 项降级</span> " +
+            degraded.map((d) => esc(d)).join(" · ");
+        }
+
+        const counts = status.table_counts || {};
+        const tiers = (status.engine && status.engine.dlq && status.engine.dlq.counts) || {};
+        const dlqTotal = Object.values(tiers).reduce((a, b) => a + Number(b || 0), 0);
+        const cards = [
+          { label: "L1 原始对话", value: counts.l1_docs || 0 },
+          { label: "L2 情景记忆", value: counts.l2_atoms || 0 },
+          { label: "L3 图谱节点/关系", value: (counts.kg_nodes || 0) + " / " + (counts.kg_edges || 0) },
+          { label: "DLQ 死信", value: dlqTotal },
+        ];
+        $("#count-grid").innerHTML = cards
+          .map(
+            (c) =>
+              '<div class="card"><div class="stat-label">' + esc(c.label) +
+              '</div><div class="stat">' + esc(c.value) + "</div></div>"
+          )
+          .join("");
+
+        const buffer = status.buffer || {};
+        const runtimeRows = [
+          ["数据库", status.db_path || "-"],
+          ["总开关 / 注入", (status.enable_memory ? "开" : "关") + " / " + (status.hooks && status.hooks.injection_enabled ? "开" : "关")],
+          ["缓冲轮次", buffer.pending_turns !== undefined ? buffer.pending_turns : "-"],
+          ["注入策略", (status.injection && status.injection.position_label) || "-"],
+          ["钩子统计", JSON.stringify(status.hook_stats || {})],
+        ];
+        $("#runtime-info").innerHTML = runtimeRows
+          .map(
+            (row) =>
+              '<div class="kv"><span>' + esc(row[0]) + "</span><span class=\"mono\">" +
+              esc(row[1]) + "</span></div>"
+          )
+          .join("");
+
+        const engine = status.engine || {};
+        const fts = engine.fts || {};
+        const cache = engine.matrix_cache || {};
+        const engineRows = [
+          ["FTS5 全文索引", fts.enabled ? "已启用" : "不可用（回退 BM25）"],
+          ["向量矩阵缓存", cache.built ? "已构建 · " + (cache.rows || cache.count || 0) + " 条" : "未构建"],
+          ["判官调用", (check.judge && check.judge.stats) ? JSON.stringify(check.judge.stats) : "-"],
+          ["图谱三元组写入", (check.kg && check.kg.triples_written) || 0],
+        ];
+        $("#engine-info").innerHTML = engineRows
+          .map(
+            (row) =>
+              '<div class="kv"><span>' + esc(row[0]) + "</span><span class=\"mono\">" +
+              esc(row[1]) + "</span></div>"
+          )
+          .join("");
+      }
+
+      async function loadOverview() {
+        const data = await apiGet("page/status");
+        renderOverview(data);
+      }
+
+      // ---------------------------------------------------------------------
+      // 服务商
+      // ---------------------------------------------------------------------
+      function fillSelect(select, items, currentId, emptyLabel) {
+        const options = ['<option value="">' + esc(emptyLabel) + "</option>"];
+        (items || []).forEach((item) => {
+          const selected = item.id === currentId ? " selected" : "";
+          const label = item.id + (item.model ? "  ·  " + item.model : "");
+          options.push(
+            '<option value="' + esc(item.id) + '"' + selected + ">" + esc(label) + "</option>"
+          );
+        });
+        select.innerHTML = options.join("");
+      }
+
+      function renderProviders(data) {
+        state.providers = data || {};
+        const available = state.providers.available || {};
+        const bindings = state.providers.bindings || {};
+        const effective = state.providers.effective || {};
+
+        fillSelect($("#sel-chat"), available.chat_completion, bindings.chat_completion || "", "（不绑定，走插件内手动配置）");
+        fillSelect($("#sel-embedding"), available.embedding, bindings.embedding || "", "（不绑定，走插件内手动配置）");
+        fillSelect($("#sel-rerank"), available.rerank, bindings.rerank || "", "（不绑定，本地 RRF 重排）");
+
+        const rows = [];
+        ["embedding", "rerank"].forEach((key) => {
+          const info = effective[key] || {};
+          rows.push([
+            key === "embedding" ? "Embedding" : "Rerank",
+            (info.mode || "-") + (info.provider_id ? " · " + info.provider_id : "") +
+              (info.model ? " · " + info.model : "") +
+              (info.dim ? " · dim " + info.dim : ""),
+          ]);
+        });
+        const llm = effective.llm || {};
+        rows.push(["总结 LLM", (llm.mode || "-") + (llm.powered ? " · 已通电" : " · 未通电")]);
+        $("#effective-info").innerHTML = rows
+          .map(
+            (row) =>
+              '<div class="kv"><span>' + esc(row[0]) + "</span><span class=\"mono\">" +
+              esc(row[1]) + "</span></div>"
+          )
+          .join("");
+      }
+
+      async function loadProviders() {
+        const data = await apiGet("page/providers");
+        renderProviders(data);
+      }
+
+      async function saveBindings() {
+        const body = {
+          chat_completion: $("#sel-chat").value,
+          embedding: $("#sel-embedding").value,
+          rerank: $("#sel-rerank").value,
+        };
+        $("#bind-result").textContent = "保存中…";
+        try {
+          const data = await apiPost("page/bindings", body);
+          const reload = data.reload || {};
+          $("#bind-result").textContent = reload.error
+            ? "已保存，但热重建失败：" + reload.error
+            : reload.warning
+            ? "已保存：" + reload.warning
+            : "已保存并热重建生效";
+          toast("服务商绑定已更新", "ok");
+          await Promise.all([loadProviders(), loadOverview()]);
+        } catch (e) {
+          $("#bind-result").textContent = "";
+          toast("保存失败：" + e.message, "err");
+        }
+      }
+
+      // ---------------------------------------------------------------------
+      // 记忆
+      // ---------------------------------------------------------------------
+      function renderMemories(data) {
+        const items = (data && data.items) || [];
+        state.total = (data && data.total) || 0;
+        $("#mem-summary").textContent = "共 " + state.total + " 条";
+        const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
+        $("#mem-page").textContent = "第 " + (state.page + 1) + " / " + pages + " 页";
+
+        if (!items.length) {
+          $("#mem-list").innerHTML = '<div class="empty">没有匹配的记忆</div>';
+          return;
+        }
+
+        $("#mem-list").innerHTML = items
+          .map((item) => {
+            const facts = Array.isArray(item.key_facts) ? item.key_facts : [];
+            const topics = Array.isArray(item.topics) ? item.topics : [];
+            return (
+              "<li>" +
+              '<div class="mem-head">' +
+              badge(Boolean(item.pinned), "置顶 L3", "L2") +
+              '<span class="badge' + (item.has_embedding ? " ok" : " warn") + '">' +
+              (item.has_embedding ? "有向量" : "无向量") + "</span>" +
+              '<span class="muted mono">' + esc(item.atom_id) + "</span>" +
+              '<span class="muted">重要性 ' + esc(Number(item.importance || 0).toFixed(2)) + "</span>" +
+              '<span class="muted">' + esc(fmtTime(item.created_at)) + "</span>" +
+              '<span style="flex:1"></span>' +
+              '<button class="tiny" data-pin="' + esc(item.atom_id) + '" data-next="' +
+              (item.pinned ? "0" : "1") + '">' + (item.pinned ? "取消置顶" : "置顶") + "</button>" +
+              "</div>" +
+              '<div class="mem-body">' + esc(item.content) + "</div>" +
+              (facts.length
+                ? '<div class="mem-facts">关键事实：' + facts.slice(0, 5).map(esc).join("；") + "</div>"
+                : "") +
+              (topics.length
+                ? '<div class="mem-facts">主题：' + topics.slice(0, 8).map(esc).join(" / ") + "</div>"
+                : "") +
+              '<div class="mem-facts mono">scope: ' + esc(item.scope_key || "-") +
+              (item.session_id ? " · session: " + esc(item.session_id) : "") +
+              "</div>" +
+              "</li>"
+            );
+          })
+          .join("");
+      }
+
+      async function loadMemories() {
+        const params = {
+          limit: state.pageSize,
+          offset: state.page * state.pageSize,
+          q: state.query,
+        };
+        if (state.pinnedOnly) params.pinned = "1";
+        const data = await apiGet("page/memories", params);
+        renderMemories(data);
+      }
+
+      async function togglePin(atomId, next) {
+        try {
+          await apiPost("page/pin", { atom_id: atomId, pinned: next === "1" });
+          toast(next === "1" ? "已置顶（晋升 L3）" : "已取消置顶", "ok");
+          await loadMemories();
+        } catch (e) {
+          toast("操作失败：" + e.message, "err");
+        }
+      }
+
+      // ---------------------------------------------------------------------
+      // 噪声 / DLQ
+      // ---------------------------------------------------------------------
+      function renderNoise(data) {
+        const stats = (data && data.stats) || {};
+        $("#noise-stats").innerHTML = [
+          ["累计检查", stats.inspected || 0],
+          ["整段丢弃", stats.dropped || 0],
+          ["部分清洗", stats.cleaned || 0],
+          ["原样放行", stats.passed || 0],
+        ]
+          .map(
+            (row) =>
+              '<div class="kv"><span>' + esc(row[0]) + '</span><span class="stat" style="font-size:16px">' +
+              esc(row[1]) + "</span></div>"
+          )
+          .join("");
+
+        const recent = (data && data.recent) || [];
+        $("#noise-list").innerHTML = recent.length
+          ? recent
+              .map(
+                (item) =>
+                  "<li>" +
+                  '<div class="mem-head">' +
+                  badge(!item.is_noise, "已清洗", "已丢弃") +
+                  '<span class="muted">' + esc(fmtTime(item.ts)) + "</span>" +
+                  '<span class="muted mono">-' + esc(item.removed_chars) + " 字符</span>" +
+                  "</div>" +
+                  '<div class="hint mono">' + esc((item.hits || []).join(", ")) + "</div>" +
+                  '<pre class="snippet">' + esc(item.preview) + "</pre>" +
+                  "</li>"
+              )
+              .join("")
+          : '<div class="empty">暂无噪声样本</div>';
+      }
+
+      function renderDlq(data) {
+        const counts = (data && data.counts) || {};
+        $("#dlq-counts").innerHTML = Object.keys(counts).length
+          ? Object.entries(counts)
+              .map(
+                ([k, v]) => '<span class="badge warn">' + esc(k) + ": " + esc(v) + "</span>"
+              )
+              .join("")
+          : '<span class="hint">队列为空</span>';
+
+        const items = (data && data.items) || [];
+        $("#dlq-list").innerHTML = items.length
+          ? items
+              .map(
+                (item) =>
+                  "<li>" +
+                  '<div class="mem-head">' +
+                  '<span class="badge bad">' + esc(item.status) + "</span>" +
+                  '<span class="mono muted">' + esc(item.task_type) + "</span>" +
+                  '<span class="muted">重试 ' + esc(item.retry_count) + "/" + esc(item.max_retries) + "</span>" +
+                  '<span class="muted">' + esc(fmtTime(item.updated_at)) + "</span>" +
+                  "</div>" +
+                  '<pre class="snippet">' + esc(item.error_msg) + "</pre>" +
+                  "</li>"
+              )
+              .join("")
+          : '<div class="empty">暂无失败任务</div>';
+      }
+
+      async function loadNoise() {
+        const [noise, dlq] = await Promise.all([
+          apiGet("page/noise", { limit: 20 }),
+          apiGet("page/dlq", { limit: 20 }),
+        ]);
+        renderNoise(noise);
+        renderDlq(dlq);
+      }
+
+      // ---------------------------------------------------------------------
+      // 交互装配
+      // ---------------------------------------------------------------------
+      const loaders = {
+        overview: loadOverview,
+        providers: loadProviders,
+        memories: loadMemories,
+        noise: loadNoise,
+      };
+
+      function activate(name) {
+        document.querySelectorAll("nav.tabs button").forEach((btn) => {
+          btn.classList.toggle("active", btn.dataset.tab === name);
+        });
+        document.querySelectorAll("section.tab").forEach((sec) => {
+          sec.classList.toggle("active", sec.id === "tab-" + name);
+        });
+        const loader = loaders[name];
+        if (loader) {
+          loader().catch((e) => toast("加载失败：" + e.message, "err"));
+        }
+      }
+
+      function bindEvents() {
+        document.querySelectorAll("nav.tabs button").forEach((btn) => {
+          btn.addEventListener("click", () => activate(btn.dataset.tab));
+        });
+
+        $("#btn-refresh").addEventListener("click", () => {
+          const active = document.querySelector("nav.tabs button.active");
+          const name = (active && active.dataset.tab) || "overview";
+          const loader = loaders[name];
+          if (loader) {
+            loader()
+              .then(() => toast("已刷新", "ok"))
+              .catch((e) => toast("刷新失败：" + e.message, "err"));
+          }
+        });
+
+        $("#btn-save-bindings").addEventListener("click", saveBindings);
+
+        $("#btn-search").addEventListener("click", () => {
+          state.query = $("#mem-query").value.trim();
+          state.pinnedOnly = $("#mem-pinned").checked;
+          state.page = 0;
+          loadMemories().catch((e) => toast("搜索失败：" + e.message, "err"));
+        });
+
+        $("#mem-query").addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") $("#btn-search").click();
+        });
+
+        $("#btn-prev").addEventListener("click", () => {
+          if (state.page <= 0) return;
+          state.page -= 1;
+          loadMemories().catch((e) => toast(e.message, "err"));
+        });
+
+        $("#btn-next").addEventListener("click", () => {
+          const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
+          if (state.page + 1 >= pages) return;
+          state.page += 1;
+          loadMemories().catch((e) => toast(e.message, "err"));
+        });
+
+        // 事件委托：置顶按钮（内容由服务端返回，必须转义后再插入 DOM）
+        $("#mem-list").addEventListener("click", (ev) => {
+          const btn = ev.target.closest("button[data-pin]");
+          if (!btn) return;
+          togglePin(btn.dataset.pin, btn.dataset.next);
+        });
+      }
+
+      let booted = false;
+      async function boot() {
+        if (booted) return;
+        booted = true;
+        bindEvents();
+        try {
+          if (VIEW && typeof VIEW.ready === "function") {
+            await VIEW.ready();
+          }
+        } catch (e) {
+          /* 桥接上下文读取失败不阻塞页面 */
+        }
+        try {
+          await loadOverview();
+        } catch (e) {
+          toast("初始化失败：" + e.message, "err");
+        }
+        // 其余页签在首次点击时按需加载，减少首屏请求
+      }
+
+      document.addEventListener("DOMContentLoaded", boot);
+      if (document.readyState === "interactive" || document.readyState === "complete") {
+        boot();
+      }
+    </script>
+  </body>
+</html>

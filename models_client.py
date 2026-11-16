@@ -302,6 +302,14 @@ class EmbeddingClient:
     - 默认模型: BAAI/bge-m3
     - 默认维度: 1024 (支持传入任意正整数 dim 并进行维度校验/对齐)
     - 异常安全降级: 网络或解析异常时返回全零向量 [0.0] * dim
+
+    P0 改造（通电）：
+    - 新增 ``backend`` 注入位，可传入 ``host_providers.EmbeddingBackend``，
+      此时优先走 AstrBot 宿主已配置的 Embedding 服务商（无需在插件里重复填密钥）；
+    - 宿主后端失败时按「宿主后端 → 手动 api_key HTTP → 零向量」三级降级，
+      任何一级失败都不会抛出异常；
+    - ``sync_provider_dim`` 为 True 时，会用宿主 Provider 声明的维度覆盖插件配置
+      的 dim，避免「配置 1024 / 实际 1536」导致向量截断补零、相似度失真。
     """
 
     def __init__(
@@ -313,6 +321,8 @@ class EmbeddingClient:
         timeout: float = 30.0,
         send_dimensions_param: bool = False,
         session: Optional["aiohttp.ClientSession"] = None,
+        backend: Optional[Any] = None,
+        sync_provider_dim: bool = True,
     ) -> None:
         if int(dim) <= 0:
             raise ValueError(f"Embedding 维度 dim 必须为正整数，当前收到: {dim}")
@@ -324,6 +334,47 @@ class EmbeddingClient:
         self.send_dimensions_param = bool(send_dimensions_param)
         # R-06：持久连接池，避免每次请求重建 Session
         self._http = _HttpSessionOwner(self.timeout, session)
+
+        # ---- P0：宿主服务商后端（可选，存在即优先使用）----
+        self.backend: Optional[Any] = backend
+        self.backend_source: str = str(
+            getattr(backend, "source", "") if backend is not None else "none"
+        ) or "none"
+        self.provider_id: str = str(
+            getattr(backend, "provider_id", "") if backend is not None else ""
+        )
+        if backend is not None:
+            backend_model = str(getattr(backend, "model", "") or "")
+            if backend_model:
+                self.model = backend_model
+            if sync_provider_dim:
+                try:
+                    provider_dim = int(getattr(backend, "dim", lambda: 0)() or 0)
+                except Exception:
+                    provider_dim = 0
+                if provider_dim > 0 and provider_dim != self.dim:
+                    logger.info(
+                        "[EmbeddingClient] 采用宿主 Provider 维度 %d（原配置 %d）。",
+                        provider_dim,
+                        self.dim,
+                    )
+                    self.dim = provider_dim
+
+    @property
+    def powered(self) -> bool:
+        """是否具备真实向量化能力（宿主 Provider 或手动 API Key 二者其一）。"""
+        return self.backend is not None or bool(self.api_key)
+
+    def describe(self) -> Dict[str, Any]:
+        """返回向量化通电状态（供自检/WebUI 使用）。"""
+        return {
+            "powered": self.powered,
+            "mode": "provider" if self.backend is not None else ("manual" if self.api_key else "none"),
+            "source": self.backend_source,
+            "provider_id": self.provider_id,
+            "model": self.model,
+            "dim": self.dim,
+        }
 
     async def close(self) -> None:
         """释放 HTTP 连接池（插件停用 / 测试清理时调用）。"""
@@ -403,6 +454,31 @@ class EmbeddingClient:
             return []
 
         cleaned_texts = [t.strip() if isinstance(t, str) and t.strip() else " " for t in texts]
+
+        # ---- P0 一级：宿主服务商后端（真实通电路径）----
+        if self.backend is not None:
+            try:
+                raw_vectors = await self.backend.embed(cleaned_texts)
+                if raw_vectors:
+                    vectors: List[List[float]] = []
+                    for vec in raw_vectors:
+                        aligned = self._validate_and_align_vector(list(vec or []))
+                        vectors.append(aligned)
+                    # 数量对齐：宿主返回不足时补零向量，保证与输入严格一一对应
+                    while len(vectors) < len(cleaned_texts):
+                        vectors.append(self.zero_vector())
+                    return vectors[: len(cleaned_texts)]
+                logger.warning(
+                    "[EmbeddingClient] 宿主 Provider(%s) 返回空向量，降级到下一级。",
+                    self.provider_id or "unknown",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[EmbeddingClient] 宿主 Provider(%s) 调用失败，降级到下一级: %s",
+                    self.provider_id or "unknown",
+                    exc,
+                )
+
         endpoint = self._build_endpoint()
 
         if not endpoint or not self.api_key or aiohttp is None:
@@ -482,6 +558,7 @@ class RerankClient:
         rrf_k: int = 60,
         embedding_client: Optional[EmbeddingClient] = None,
         session: Optional["aiohttp.ClientSession"] = None,
+        backend: Optional[Any] = None,
     ) -> None:
         self.api_base = (api_base or "").strip().rstrip("/")
         self.api_key = (api_key or "").strip()
@@ -491,6 +568,34 @@ class RerankClient:
         self.embedding_client = embedding_client
         # R-06：持久连接池，避免每次请求重建 Session
         self._http = _HttpSessionOwner(self.timeout, session)
+
+        # ---- P0：宿主 Rerank 服务商后端（可选，存在即优先使用）----
+        self.backend: Optional[Any] = backend
+        self.backend_source: str = str(
+            getattr(backend, "source", "") if backend is not None else "none"
+        ) or "none"
+        self.provider_id: str = str(
+            getattr(backend, "provider_id", "") if backend is not None else ""
+        )
+        if backend is not None:
+            backend_model = str(getattr(backend, "model", "") or "")
+            if backend_model:
+                self.model = backend_model
+
+    @property
+    def powered(self) -> bool:
+        """是否具备真实交叉编码器重排能力（宿主 Provider 或手动 API Key）。"""
+        return self.backend is not None or bool(self.api_key)
+
+    def describe(self) -> Dict[str, Any]:
+        """返回重排通电状态（供自检/WebUI 使用）。"""
+        return {
+            "powered": self.powered,
+            "mode": "provider" if self.backend is not None else ("manual" if self.api_key else "none"),
+            "source": self.backend_source,
+            "provider_id": self.provider_id,
+            "model": self.model,
+        }
 
     async def close(self) -> None:
         """释放 HTTP 连接池（插件停用 / 测试清理时调用）。"""
@@ -539,6 +644,32 @@ class RerankClient:
             return []
 
         effective_top_n = max(1, min(int(top_n), len(documents))) if top_n else len(documents)
+
+        # ---- P0 一级：宿主 Rerank 服务商后端（真实通电路径）----
+        if self.backend is not None:
+            try:
+                pairs = await self.backend.rerank(query or "", documents, effective_top_n)
+                if pairs:
+                    return [
+                        {
+                            "index": idx,
+                            "document": documents[idx],
+                            "relevance_score": float(score),
+                        }
+                        for idx, score in pairs
+                        if 0 <= idx < len(documents)
+                    ]
+                logger.debug(
+                    "[RerankClient] 宿主 Provider(%s) 返回空结果，降级到下一级。",
+                    self.provider_id or "unknown",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[RerankClient] 宿主 Provider(%s) 调用失败，降级到下一级: %s",
+                    self.provider_id or "unknown",
+                    exc,
+                )
+
         endpoint = self._build_endpoint()
 
         if not endpoint or not self.api_key or aiohttp is None:

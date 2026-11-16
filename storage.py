@@ -9,6 +9,7 @@ astrbot_plugin_agent_memory - 分层记忆存储引擎骨架 (SQLite)
 5. task_dlq  - 异步总结/向量化任务死信与重试队列表
 """
 
+import json
 import os
 import re
 import sqlite3
@@ -1731,6 +1732,256 @@ class MemoryStorage:
             logger.error("toggle_atom_pin 失败 (atom_id=%s): %s", aid, exc, exc_info=True)
             result["error"] = str(exc)
 
+        return result
+
+    # ------------------------------------------------------------------
+    # P0：WebUI 只读查询接口（记忆浏览 / 搜索 / 死信排查）
+    #   设计原则：全部只读、全部容错，任何异常返回空结果而非抛出。
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _atom_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+        """把 l2_atoms 行转换成 WebUI 友好的 dict（容错处理 JSON 字段）。"""
+        def _loads(raw: Any, fallback: Any) -> Any:
+            try:
+                if raw is None or raw == "":
+                    return fallback
+                value = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+                return value
+            except Exception:
+                return fallback
+
+        keys = set(row.keys()) if hasattr(row, "keys") else set()
+        pinned = int(row["pinned"] or 0) if "pinned" in keys else 0
+        tier = int(row["tier"] or 2) if "tier" in keys else 2
+        return {
+            "atom_id": str(row["atom_id"]),
+            "scope_key": str(row["scope_key"] or ""),
+            "session_id": str(row["session_id"] or ""),
+            "content": str(row["content"] or ""),
+            "topics": _loads(row["topics_json"], []),
+            "key_facts": _loads(row["key_facts_json"], []),
+            "sentiment": str(row["sentiment"] or "neutral"),
+            "importance": float(row["importance"] or 0.0),
+            "access_count": int(row["access_count"] or 0),
+            "pinned": bool(pinned) or tier >= 3,
+            "tier": tier,
+            "source_type": str(row["source_type"] or ""),
+            "created_at": float(row["created_at"] or 0.0),
+            "updated_at": float(row["updated_at"] or 0.0),
+            "last_accessed_at": float(row["last_accessed_at"] or 0.0),
+            "has_embedding": bool(row["embedding_blob"]),
+            "status": str(row["status"] or "active") if "status" in keys else "active",
+        }
+
+    def _atom_columns(self, conn: sqlite3.Connection) -> set:
+        try:
+            return {str(r[1]) for r in conn.execute("PRAGMA table_info(l2_atoms)")}
+        except Exception:
+            return set()
+
+    def list_memories(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        query: str = "",
+        pinned_only: bool = False,
+        include_superseded: bool = False,
+        scope_key: str = "",
+    ) -> Dict[str, Any]:
+        """
+        分页浏览 / 搜索 L2 情景记忆（WebUI 主列表）。
+
+        返回 ``{"items": [...], "total": int, "limit": int, "offset": int}``；
+        任何异常都返回空列表，保证 WebUI 永不 500。
+        """
+        try:
+            lim = max(1, min(int(limit), 200))
+        except (TypeError, ValueError):
+            lim = 20
+        try:
+            off = max(0, int(offset))
+        except (TypeError, ValueError):
+            off = 0
+
+        result: Dict[str, Any] = {"items": [], "total": 0, "limit": lim, "offset": off}
+        try:
+            conn = self.connect()
+            cols = self._atom_columns(conn)
+            has_status = "status" in cols
+            has_pinned = "pinned" in cols
+            has_tier = "tier" in cols
+
+            where: List[str] = []
+            params: List[Any] = []
+            if scope_key:
+                where.append("scope_key = ?")
+                params.append(str(scope_key))
+            if pinned_only and (has_pinned or has_tier):
+                conds = []
+                if has_pinned:
+                    conds.append("pinned = 1")
+                if has_tier:
+                    conds.append("tier >= 3")
+                where.append("(" + " OR ".join(conds) + ")")
+            if has_status and not include_superseded:
+                where.append("COALESCE(status, 'active') != 'superseded'")
+
+            term = str(query or "").strip()
+            if term:
+                like = f"%{term}%"
+                where.append("(content LIKE ? OR key_facts_json LIKE ?)")
+                params.extend([like, like])
+
+            where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+
+            total_row = conn.execute(
+                f"SELECT COUNT(1) AS cnt FROM l2_atoms{where_sql}", params
+            ).fetchone()
+            result["total"] = int(total_row["cnt"]) if total_row is not None else 0
+
+            order_col = "pinned DESC, " if has_pinned else ""
+            rows = conn.execute(
+                f"SELECT * FROM l2_atoms{where_sql} "
+                f"ORDER BY {order_col}created_at DESC LIMIT ? OFFSET ?",
+                params + [lim, off],
+            ).fetchall()
+            result["items"] = [self._atom_row_to_dict(row) for row in rows]
+        except Exception as exc:
+            logger.error("list_memories 查询失败: %s", exc, exc_info=True)
+        return result
+
+    def get_memory_detail(self, atom_id: str) -> Optional[Dict[str, Any]]:
+        """按 atom_id 读取单条记忆完整详情（含关联图谱三元组）。"""
+        aid = str(atom_id or "").strip()
+        if not aid:
+            return None
+        try:
+            conn = self.connect()
+            row = conn.execute(
+                "SELECT * FROM l2_atoms WHERE atom_id = ?", (aid,)
+            ).fetchone()
+            if row is None:
+                return None
+            detail = self._atom_row_to_dict(row)
+            detail["triples"] = []
+            try:
+                cur = conn.execute(
+                    """
+                    SELECT s.entity_name AS head, e.relation_type AS relation,
+                           t.entity_name AS tail, e.confidence AS confidence,
+                           e.status AS status
+                    FROM kg_edges e
+                    JOIN kg_nodes s ON s.node_id = e.source_node_id
+                    JOIN kg_nodes t ON t.node_id = e.target_node_id
+                    WHERE e.atom_id = ?
+                    LIMIT 50
+                    """,
+                    (aid,),
+                )
+                detail["triples"] = [
+                    {
+                        "head": str(r["head"] or ""),
+                        "relation": str(r["relation"] or ""),
+                        "tail": str(r["tail"] or ""),
+                        "confidence": float(r["confidence"] or 0.0),
+                        "status": str(r["status"] or "active"),
+                    }
+                    for r in cur.fetchall()
+                ]
+            except Exception as exc:
+                logger.debug("读取记忆关联三元组失败（忽略）: %s", exc)
+            return detail
+        except Exception as exc:
+            logger.error("get_memory_detail 失败: %s", exc, exc_info=True)
+            return None
+
+    def set_atom_pin(self, atom_id: str, pinned: bool) -> Dict[str, Any]:
+        """
+        显式设置 L2 原子的置顶状态（WebUI 勾选框用，与 toggle_atom_pin 互补）。
+
+        行为：pinned=True → pinned=1/tier=3（晋升 L3）；False → pinned=0/tier=2。
+        """
+        result: Dict[str, Any] = {
+            "found": False,
+            "atom_id": str(atom_id or "").strip(),
+            "is_pinned": bool(pinned),
+            "error": "",
+        }
+        aid = result["atom_id"]
+        if not aid:
+            result["error"] = "atom_id 为空"
+            return result
+        try:
+            conn = self.connect()
+            cols = self._atom_columns(conn)
+            with conn:
+                if "pinned" not in cols:
+                    conn.execute(
+                        "ALTER TABLE l2_atoms ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;"
+                    )
+                if "tier" not in cols:
+                    conn.execute(
+                        "ALTER TABLE l2_atoms ADD COLUMN tier INTEGER NOT NULL DEFAULT 2;"
+                    )
+            row = conn.execute(
+                "SELECT atom_id FROM l2_atoms WHERE atom_id = ?", (aid,)
+            ).fetchone()
+            if row is None:
+                result["error"] = "记录不存在"
+                return result
+            with conn:
+                conn.execute(
+                    "UPDATE l2_atoms SET pinned = ?, tier = ?, updated_at = ? WHERE atom_id = ?",
+                    (1 if pinned else 0, 3 if pinned else 2, time.time(), aid),
+                )
+            result["found"] = True
+        except Exception as exc:
+            logger.error("set_atom_pin 失败 (atom_id=%s): %s", aid, exc, exc_info=True)
+            result["error"] = str(exc)
+        return result
+
+    def list_dlq(self, limit: int = 20, status: str = "") -> Dict[str, Any]:
+        """列出死信队列条目（WebUI 噪声/失败排查用）。"""
+        try:
+            lim = max(1, min(int(limit), 200))
+        except (TypeError, ValueError):
+            lim = 20
+        result: Dict[str, Any] = {"items": [], "counts": {}}
+        try:
+            conn = self.connect()
+            for row in conn.execute(
+                "SELECT status, COUNT(1) AS cnt FROM task_dlq GROUP BY status"
+            ).fetchall():
+                result["counts"][str(row["status"])] = int(row["cnt"] or 0)
+
+            sql = (
+                "SELECT task_id, task_type, scope_key, error_msg, retry_count, "
+                "max_retries, status, next_retry_at, created_at, updated_at "
+                "FROM task_dlq"
+            )
+            params: List[Any] = []
+            if status:
+                sql += " WHERE status = ?"
+                params.append(str(status))
+            sql += " ORDER BY updated_at DESC LIMIT ?"
+            params.append(lim)
+            result["items"] = [
+                {
+                    "task_id": str(r["task_id"]),
+                    "task_type": str(r["task_type"] or ""),
+                    "scope_key": str(r["scope_key"] or ""),
+                    "error_msg": str(r["error_msg"] or "")[:400],
+                    "retry_count": int(r["retry_count"] or 0),
+                    "max_retries": int(r["max_retries"] or 0),
+                    "status": str(r["status"] or ""),
+                    "next_retry_at": float(r["next_retry_at"] or 0.0),
+                    "created_at": float(r["created_at"] or 0.0),
+                    "updated_at": float(r["updated_at"] or 0.0),
+                }
+                for r in conn.execute(sql, params).fetchall()
+            ]
+        except Exception as exc:
+            logger.error("list_dlq 失败: %s", exc, exc_info=True)
         return result
 
     def close(self) -> None:

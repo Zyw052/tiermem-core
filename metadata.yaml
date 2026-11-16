@@ -1,5 +1,8 @@
 name: astrbot_plugin_agent_memory
-desc: 智涌原生分层记忆插件 (L1工作区/L2情景/L3画像 + 独立总结模型 + 资产无缝迁移 + 专属WebUI)
-version: 1.0.0
+desc: 智涌原生分层记忆插件（L1 原始对话 / L2 情景记忆 / L3 知识图谱，服务商选择器直连宿主 Provider + 内置记忆面板 WebUI + 系统噪声过滤）
+version: 1.1.0
 author: Vivian & Master
 repo: ""
+views:
+  - name: dashboard
+    title: 记忆面板

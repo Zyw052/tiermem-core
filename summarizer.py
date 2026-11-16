@@ -19,7 +19,16 @@ import sqlite3
 import struct
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 try:
     import aiohttp
@@ -48,6 +57,27 @@ except ImportError:
         from .storage import MemoryStorage as StorageManager
     except ImportError:  # pragma: no cover
         from storage import MemoryStorage as StorageManager  # type: ignore
+
+# P0：系统噪声过滤（写入/抽取入口统一拦截系统注入块与后台回调噪声）
+try:
+    from .noise_filter import get_noise_filter
+except ImportError:  # pragma: no cover
+    try:
+        from noise_filter import get_noise_filter  # type: ignore
+    except ImportError:  # pragma: no cover - 极端兜底：无过滤器时退化为直通
+        def get_noise_filter():  # type: ignore
+            class _Passthrough:
+                def inspect(self, text):
+                    class _V:
+                        original = "" if text is None else str(text)
+                        cleaned_text = original
+                        is_noise = False
+                        hits: list = []
+                        removed_chars = 0
+
+                    return _V()
+
+            return _Passthrough()
 
 # 方案 B：FTS5 预分词工具（用于写入路径同步倒排索引文本）
 try:
@@ -168,16 +198,27 @@ class MemorySummarizer:
         embedding_client: EmbeddingClient,
         rerank_client: Optional[RerankClient] = None,
         config: Optional[ dict ] = None,
+        llm_call: Optional[Callable[[List[Dict[str, str]], str], Awaitable[str]]] = None,
+        evaluator_llm_client: Optional[
+            Callable[[List[Dict[str, str]], str], Awaitable[str]]
+        ] = None,
     ) -> None:
         self.storage = storage
         self.embedding_client = embedding_client
         self.rerank_client = rerank_client
         self.config: Dict[str, Any] = config or {}
 
+        # ---- P0：宿主服务商注入的 LLM 调用能力（None 时回退 HTTP / 规则）----
+        # 签名：async (messages: [{"role","content"}], model: str) -> str
+        self._llm_call = llm_call
+        self._evaluator_llm_client = evaluator_llm_client
+
         # ---- 自作判定门禁（廉价模型：默认 jev）----
         # 门禁自身的所有异常都在 EvaluatorGate 内部消化，这里无需再包 try。
         try:
-            self.evaluator = EvaluatorGate(self.config)
+            self.evaluator = EvaluatorGate(
+                self.config, llm_client=self._evaluator_llm_client
+            )
         except Exception as exc:  # pragma: no cover - 极端配置兜底
             logger.warning(
                 "[MemorySummarizer] EvaluatorGate 初始化失败，判定门禁将被禁用: %s", exc
@@ -836,6 +877,27 @@ class MemorySummarizer:
         if not sid or (not user and not bot):
             return False
 
+        # ---- P0：系统噪声拦截（写入入口）----
+        # 宿主机/子代理/其它插件会往会话里注入系统块（后台任务回调、项目大盘、
+        # RAG 标记等）。这些内容必须在落库前剔除，否则会污染 L1/L2 并被反复召回。
+        try:
+            nf = get_noise_filter()
+            u_verdict = nf.inspect(user)
+            b_verdict = nf.inspect(bot)
+            if u_verdict.is_noise and b_verdict.is_noise:
+                logger.debug(
+                    "[MemorySummarizer] 整轮判定为系统噪声，已丢弃 session=%s hits=%s",
+                    sid,
+                    sorted(set(u_verdict.hits) | set(b_verdict.hits)),
+                )
+                return False
+            user = "" if u_verdict.is_noise else u_verdict.cleaned_text
+            bot = "" if b_verdict.is_noise else b_verdict.cleaned_text
+            if not user and not bot:
+                return False
+        except Exception as exc:  # pragma: no cover - 过滤器异常绝不阻断写入
+            logger.debug("[MemorySummarizer] 噪声过滤异常（忽略）: %s", exc)
+
         # R-02：先实时落盘 L1 原始轮次，保证“未满 N 轮就断电/重启”也不丢对话
         l1_doc_id = self._record_l1_dialogue(sid, user, bot, time.time())
 
@@ -1367,6 +1429,34 @@ class MemorySummarizer:
         ).strip()
         timeout_sec = float(summarizer_cfg.get("timeout_seconds", 20.0))
 
+        # 抽取提示词（宿主 Provider 与手动 HTTP 两条路径共用，保证行为一致）
+        extract_prompt = (
+            "请从以下多轮对话中提取值得长期记住的客观事实、用户偏好、习惯或约束。"
+            "返回 JSON 数组，每项格式为: "
+            '{"fact": "简洁事实陈述", "importance": 0.0到1.0之间的小数, '
+            '"triples": [{"head": "主体", "relation": "关系", "tail": "客体"}]}。'
+            "triples 为可选字段，用于构建知识图谱（例如 "
+            '{"head":"主人","relation":"偏好","tail":"美式咖啡"}）。\n'
+            f"{context}"
+        )
+
+        # ---- P0 一级：宿主服务商 LLM（provider_id 选完即通电）----
+        if self._llm_call is not None:
+            try:
+                content = await self._llm_call(
+                    [{"role": "user", "content": extract_prompt}], model
+                )
+                llm_facts = self._parse_llm_facts(str(content or ""), max_facts)
+                if llm_facts:
+                    return llm_facts
+                logger.debug(
+                    "[MemorySummarizer] 宿主 Provider 抽取结果为空，降级到下一级。"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[MemorySummarizer] 宿主 Provider 抽取失败，降级到下一级: %s", exc
+                )
+
         if api_base and api_key and aiohttp is not None:
             endpoint = (
                 api_base
@@ -1641,6 +1731,24 @@ class MemorySummarizer:
         返回 (atom_id, is_merged)
         """
         fact_text = str(fact_item["fact"]).strip()
+
+        # ---- P0：L2 写入二次兜底 ----
+        # 即使上游（LLM 抽取 / 规则抽取）产出的是噪声片段，也绝不允许落库。
+        try:
+            verdict = get_noise_filter().inspect(fact_text)
+            if verdict.is_noise:
+                logger.debug(
+                    "[MemorySummarizer] 丢弃噪声事实 session=%s hits=%s",
+                    session_id,
+                    verdict.hits,
+                )
+                return "", False
+            fact_text = verdict.cleaned_text
+            if not fact_text:
+                return "", False
+        except Exception as exc:  # pragma: no cover
+            logger.debug("[MemorySummarizer] 事实噪声过滤异常（忽略）: %s", exc)
+
         importance = float(fact_item["importance"])
         pinned = int(fact_item["pinned"])
         atom_type = str(fact_item.get("atom_type", "fact"))
@@ -2197,6 +2305,9 @@ class MemorySummarizer:
                     source_doc_id=source_doc_id,
                     now=now,
                 )
+                if not atom_id:
+                    # P0：噪声事实在写入层被拦截，跳过图谱与映射，避免空 atom_id 下游副作用
+                    continue
                 fact_atom_map[_normalize_fact_key(fact_text)] = atom_id
                 # 方案 C：图谱三元组写入（失败不阻断 L2 入库主链路）
                 try:

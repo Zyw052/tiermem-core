@@ -11,3 +11,27 @@ __pycache__/
 plugin_data/
 .DS_Store
 .env
+
+# --- test / tooling caches (never commit) ---
+.pytest_cache/
+.tox/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- plugin runtime state (contains user data / provider bindings) ---
+provider_bindings.json
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+
+# --- virtualenv / packaging ---
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/

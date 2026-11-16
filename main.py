@@ -75,12 +75,28 @@ try:
     from .summarizer import MemorySummarizer
     from .evaluator import DEFAULT_EVALUATOR_MODEL
     from .retriever import MemoryRetriever
+    from .host_providers import (
+        KIND_CHAT,
+        KIND_EMBEDDING,
+        KIND_RERANK,
+        ProviderBridge,
+    )
+    from .noise_filter import filter_turn, get_noise_filter
+    from .page_api import PluginPageApi
 except ImportError:  # pragma: no cover
     from storage import MemoryStorage  # type: ignore
     from models_client import EmbeddingClient, RerankClient  # type: ignore
     from summarizer import MemorySummarizer  # type: ignore
     from evaluator import DEFAULT_EVALUATOR_MODEL  # type: ignore
     from retriever import MemoryRetriever  # type: ignore
+    from host_providers import (  # type: ignore
+        KIND_CHAT,
+        KIND_EMBEDDING,
+        KIND_RERANK,
+        ProviderBridge,
+    )
+    from noise_filter import filter_turn, get_noise_filter  # type: ignore
+    from page_api import PluginPageApi  # type: ignore
 
 
 PLUGIN_NAME = "astrbot_plugin_agent_memory"
@@ -381,6 +397,22 @@ def _extract_text_from_event_result(event: Any) -> str:
     return ""
 
 
+def _make_llm_call(backend: Any):
+    """
+    把宿主 Chat 后端适配成 summarizer / evaluator 需要的调用桩。
+
+    签名：``async (messages: list[dict], model: str) -> str``
+    backend 为 None 时返回 None（上层据此回退到 HTTP 或规则路径）。
+    """
+    if backend is None:
+        return None
+
+    async def _call(messages: Any, model: str = "") -> str:
+        return await backend.chat(messages, model)
+
+    return _call
+
+
 @register(
     PLUGIN_NAME,
     "Vivian & Master",
@@ -414,6 +446,20 @@ class AgentMemoryPlugin(Star):
         self.summarizer: Optional[MemorySummarizer] = None
         self.retriever: Optional[MemoryRetriever] = None
 
+        # ---- P0：宿主服务商桥接（provider_id → 真实能力）----
+        # 该桥接器负责把「配置里的 provider_id」解析成宿主真实 Provider 实例，
+        # 从而让 Embedding / Rerank / LLM 直接复用 AstrBot 已配置的服务商与密钥。
+        try:
+            self.provider_bridge: Optional[ProviderBridge] = ProviderBridge(
+                context=self.context, data_dir=self.data_dir
+            )
+        except Exception as exc:  # pragma: no cover - 极端兜底
+            logger.warning("[agent_memory] 服务商桥接初始化失败（降级）: %s", exc)
+            self.provider_bridge = None
+
+        # ---- P0：最近一次装配的自检快照（供 /memory status 与 WebUI 读取）----
+        self._self_check: Dict[str, Any] = {}
+
         # Stage 3：迁移引擎类（导入失败时为 None，指令层降级提示）
         self._migrator_cls: Optional[type] = _load_migrator_class()
 
@@ -440,10 +486,24 @@ class AgentMemoryPlugin(Star):
                 self.turn_interval,
                 self.enable_memory,
             )
+            self._log_self_check()
         except Exception as exc:
             logger.error(
                 "[agent_memory] 组件装配失败，插件将以降级模式运行: %s", exc, exc_info=True
             )
+
+        # ---- 4. P0：注册插件 WebUI 后端 API ----
+        # 页面本体位于 views/dashboard/index.html，由宿主 plugin_page_service
+        # 自动发现；本步骤只负责把数据接口挂到 /api/v1/plugins/extensions/ 下。
+        self.page_api: Optional[PluginPageApi] = None
+        try:
+            if bool(self._section("webui").get("register_api", True)):
+                self.page_api = PluginPageApi(self)
+                self.page_api.register_routes()
+            else:
+                logger.info("[agent_memory] webui.register_api=False，跳过页面接口注册。")
+        except Exception as exc:  # pragma: no cover - WebUI 失败不影响主链路
+            logger.warning("[agent_memory] 插件 WebUI API 注册失败（忽略）: %s", exc)
 
     # ------------------------------------------------------------------
     # 配置解析
@@ -541,19 +601,51 @@ class AgentMemoryPlugin(Star):
         return storage
 
     def _build_embedding_client(self) -> EmbeddingClient:
-        """构建 Embedding 客户端（优先插件配置，其次 provider_id 解析值，最后默认值）。"""
+        """
+        构建 Embedding 客户端。
+
+        P0 通电优先级（从高到低）：
+        1. 宿主 Embedding 服务商（``embedding_provider_id`` 或 WebUI 运行期绑定）；
+        2. 插件内手填的 ``models.embedding.api_base/api_key/model``（兜底）；
+        3. 零向量降级（不阻塞主链路，但会在自检中明确标注）。
+
+        说明：``api_base`` 不再默认写死 SiliconFlow —— 没有密钥时保持空串，
+        让自检如实反映「未通电」，避免默认端点造成「看似配置了」的假象。
+        """
         summarizer_cfg = self._section("summarizer")
         models_cfg = self._section("models")
         emb_cfg = models_cfg.get("embedding") if isinstance(models_cfg.get("embedding"), dict) else {}
-        provider_creds = self._resolve_provider_credentials(
-            summarizer_cfg.get("embedding_provider_id")
+
+        # 服务商 ID：顶层（新 schema）→ summarizer 子节点（旧配置兼容）
+        provider_id = _first_non_empty(
+            self.config.get("embedding_provider_id"),
+            summarizer_cfg.get("embedding_provider_id"),
+            default="",
         )
 
+        # ---- 1) 宿主服务商后端 ----
+        backend = None
+        if self.provider_bridge is not None:
+            try:
+                backend = self.provider_bridge.build_embedding_backend(
+                    str(provider_id), allow_auto=False
+                )
+            except Exception as exc:
+                logger.warning("[agent_memory] 解析 Embedding 服务商失败: %s", exc)
+
+        # ---- 2) 手动凭证兜底（仅在后端缺失时才需要）----
+        provider_creds = self._resolve_provider_credentials(
+            _first_non_empty(
+                provider_id,
+                summarizer_cfg.get("embedding_provider_id"),
+                default="",
+            )
+        )
         api_base = _first_non_empty(
             emb_cfg.get("api_base"),
             provider_creds.get("api_base"),
             summarizer_cfg.get("embedding_api_base"),
-            default=DEFAULT_EMBEDDING_API_BASE,
+            default="" if backend is not None else DEFAULT_EMBEDDING_API_BASE,
         )
         api_key = _first_non_empty(
             emb_cfg.get("api_key"),
@@ -570,6 +662,14 @@ class AgentMemoryPlugin(Star):
         dim = _safe_int(emb_cfg.get("dim"), DEFAULT_EMBEDDING_DIM, minimum=1)
         timeout = _safe_float(emb_cfg.get("timeout"), DEFAULT_EMBEDDING_TIMEOUT)
 
+        logger.info(
+            "[agent_memory] Embedding 装配 | provider_id=%s | backend=%s | mode=%s | model=%s",
+            provider_id or "-",
+            "yes" if backend is not None else "no",
+            "provider" if backend is not None else ("manual" if api_key else "degraded"),
+            getattr(backend, "model", "") or model,
+        )
+
         return EmbeddingClient(
             api_base=str(api_base),
             api_key=str(api_key),
@@ -577,22 +677,47 @@ class AgentMemoryPlugin(Star):
             dim=dim,
             timeout=timeout,
             send_dimensions_param=bool(emb_cfg.get("send_dimensions_param", False)),
+            backend=backend,
+            sync_provider_dim=True,
         )
 
     def _build_rerank_client(self, embedding_client: EmbeddingClient) -> RerankClient:
-        """构建 Rerank 客户端（未配置密钥时自动降级为本地 RRF 重排）。"""
+        """
+        构建 Rerank 客户端。
+
+        P0 通电优先级：宿主 Rerank 服务商 → 手填 API 凭证 → 本地 RRF 降级。
+        """
         summarizer_cfg = self._section("summarizer")
         models_cfg = self._section("models")
         rerank_cfg = models_cfg.get("rerank") if isinstance(models_cfg.get("rerank"), dict) else {}
-        provider_creds = self._resolve_provider_credentials(
-            summarizer_cfg.get("rerank_provider_id")
+
+        provider_id = _first_non_empty(
+            self.config.get("rerank_provider_id"),
+            summarizer_cfg.get("rerank_provider_id"),
+            default="",
         )
 
+        backend = None
+        if self.provider_bridge is not None:
+            try:
+                backend = self.provider_bridge.build_rerank_backend(
+                    str(provider_id), allow_auto=False
+                )
+            except Exception as exc:
+                logger.warning("[agent_memory] 解析 Rerank 服务商失败: %s", exc)
+
+        provider_creds = self._resolve_provider_credentials(
+            _first_non_empty(
+                provider_id,
+                summarizer_cfg.get("rerank_provider_id"),
+                default="",
+            )
+        )
         api_base = _first_non_empty(
             rerank_cfg.get("api_base"),
             provider_creds.get("api_base"),
             summarizer_cfg.get("rerank_api_base"),
-            default=DEFAULT_RERANK_API_BASE,
+            default="" if backend is not None else DEFAULT_RERANK_API_BASE,
         )
         api_key = _first_non_empty(
             rerank_cfg.get("api_key"),
@@ -609,6 +734,14 @@ class AgentMemoryPlugin(Star):
         timeout = _safe_float(rerank_cfg.get("timeout"), DEFAULT_RERANK_TIMEOUT)
         rrf_k = _safe_int(rerank_cfg.get("rrf_k"), DEFAULT_RRF_K, minimum=1)
 
+        logger.info(
+            "[agent_memory] Rerank 装配 | provider_id=%s | backend=%s | mode=%s | model=%s",
+            provider_id or "-",
+            "yes" if backend is not None else "no",
+            "provider" if backend is not None else ("manual" if api_key else "rrf-degraded"),
+            getattr(backend, "model", "") or model,
+        )
+
         return RerankClient(
             api_base=str(api_base),
             api_key=str(api_key),
@@ -616,6 +749,7 @@ class AgentMemoryPlugin(Star):
             timeout=timeout,
             rrf_k=rrf_k,
             embedding_client=embedding_client,
+            backend=backend,
         )
 
     def _build_summarizer(
@@ -627,8 +761,24 @@ class AgentMemoryPlugin(Star):
         """构建总结 Worker，并把 summary_turn_interval 等配置注入。"""
         summarizer_cfg = dict(self._section("summarizer"))
 
-        # 总结 LLM 凭证：插件配置优先，其次 provider_id 解析，其次 embedding 同名配置
-        provider_creds = self._resolve_provider_credentials(summarizer_cfg.get("provider_id"))
+        # 总结 LLM 凭证：宿主服务商优先，其次插件手填，其次 embedding 同名配置
+        chat_provider_id = _first_non_empty(
+            self.config.get("llm_provider_id"),
+            summarizer_cfg.get("provider_id"),
+            default="",
+        )
+        chat_backend = None
+        if self.provider_bridge is not None:
+            try:
+                chat_backend = self.provider_bridge.build_chat_backend(
+                    str(chat_provider_id), allow_auto=False
+                )
+            except Exception as exc:
+                logger.warning("[agent_memory] 解析总结 LLM 服务商失败: %s", exc)
+
+        provider_creds = self._resolve_provider_credentials(
+            _first_non_empty(chat_provider_id, summarizer_cfg.get("provider_id"), default="")
+        )
         llm_api_base = _first_non_empty(
             summarizer_cfg.get("api_base"),
             provider_creds.get("api_base"),
@@ -645,10 +795,41 @@ class AgentMemoryPlugin(Star):
             default="",
         )
 
-        # 自作判定门禁（廉价模型，默认 jev）：凭证留空则回退主总结模型
+        # 判官（jev）服务商：evaluator.provider_id → llm_provider_id → summarizer.provider_id
         evaluator_cfg = dict(self._section("evaluator"))
+        evaluator_provider_id = _first_non_empty(
+            self.config.get("judge_provider_id"),
+            evaluator_cfg.get("provider_id"),
+            self.config.get("llm_provider_id"),
+            summarizer_cfg.get("provider_id"),
+            default="",
+        )
+        evaluator_backend = None
+        if self.provider_bridge is not None:
+            try:
+                evaluator_backend = self.provider_bridge.build_chat_backend(
+                    str(evaluator_provider_id), allow_auto=False
+                )
+            except Exception as exc:
+                logger.debug("[agent_memory] 解析判官服务商失败（忽略）: %s", exc)
+
+        # 宿主 Provider 调用桩（签名：async (messages, model) -> str）
+        summarizer_llm_call = _make_llm_call(chat_backend)
+        evaluator_llm_client = _make_llm_call(evaluator_backend)
+
+        logger.info(
+            "[agent_memory] 总结/判官装配 | llm_provider=%s(%s) | judge_provider=%s(%s) | judge_model=%s",
+            chat_provider_id or "-",
+            "provider" if chat_backend is not None else ("manual" if llm_api_key else "rule-fallback"),
+            evaluator_provider_id or "-",
+            "provider" if evaluator_backend is not None else "inherit",
+            evaluator_cfg.get("model_name") or DEFAULT_EVALUATOR_MODEL,
+        )
+
+        # 自作判定门禁（廉价模型，默认 jev）：凭证留空则回退主总结模型
         evaluator_runtime: Dict[str, Any] = {
             "enable": bool(evaluator_cfg.get("enable", True)),
+            "provider_id": evaluator_provider_id,
             "api_base": _first_non_empty(
                 evaluator_cfg.get("api_base"), llm_api_base, default=""
             ),
@@ -721,6 +902,8 @@ class AgentMemoryPlugin(Star):
             embedding_client=embedding_client,
             rerank_client=rerank_client,
             config=runtime_cfg,
+            llm_call=summarizer_llm_call,
+            evaluator_llm_client=evaluator_llm_client,
         )
 
     def _build_retriever(
@@ -800,6 +983,242 @@ class AgentMemoryPlugin(Star):
             type(self.summarizer).__name__,
             type(self.retriever).__name__,
         )
+
+    # ------------------------------------------------------------------
+    # P0：通电自检（WebUI 首屏 + /memory status 共用同一份口径）
+    # ------------------------------------------------------------------
+    def build_self_check(self) -> Dict[str, Any]:
+        """
+        生成「引擎是否真实通电」的自检快照。
+
+        与旧 ``_component_health`` 的关键差别：
+        - 旧口径只看 ``api_key`` 是否非空，宿主服务商模式下会误报「不健康」；
+        - 新口径看「是否真的具备能力」：宿主 Provider 已绑定 或 手填凭证存在；
+        - 额外给出 ``degraded`` 原因，便于主人一眼看出降级在哪个环节。
+        """
+        emb = self.embedding_client
+        rerank = self.rerank_client
+        summarizer = self.summarizer
+
+        # ---- 向量化 ----
+        emb_info: Dict[str, Any] = {"present": emb is not None}
+        try:
+            if emb is not None and hasattr(emb, "describe"):
+                emb_info.update(emb.describe())
+            else:
+                emb_info["powered"] = bool(str(_safe_attr(emb, "api_key", "") or "").strip())
+                emb_info["mode"] = "manual" if emb_info["powered"] else "none"
+                emb_info["model"] = str(_safe_attr(emb, "model", "") or "")
+                emb_info["dim"] = int(_safe_attr(emb, "dim", 0) or 0)
+        except Exception as exc:
+            emb_info["error"] = str(exc)
+
+        # ---- 重排 ----
+        rerank_info: Dict[str, Any] = {"present": rerank is not None}
+        try:
+            if rerank is not None and hasattr(rerank, "describe"):
+                rerank_info.update(rerank.describe())
+            else:
+                rerank_info["powered"] = bool(
+                    str(_safe_attr(rerank, "api_key", "") or "").strip()
+                )
+                rerank_info["mode"] = "manual" if rerank_info["powered"] else "rrf"
+                rerank_info["model"] = str(_safe_attr(rerank, "model", "") or "")
+        except Exception as exc:
+            rerank_info["error"] = str(exc)
+
+        # ---- 总结 LLM / 判官 ----
+        llm_info: Dict[str, Any] = {"present": summarizer is not None}
+        judge_info: Dict[str, Any] = {"present": False}
+        try:
+            llm_call = getattr(summarizer, "_llm_call", None) if summarizer else None
+            llm_info["mode"] = "provider" if llm_call is not None else "manual-or-rule"
+            llm_info["powered"] = llm_call is not None
+            evaluator = getattr(summarizer, "evaluator", None) if summarizer else None
+            if evaluator is not None:
+                describe = getattr(evaluator, "describe", None)
+                judge_payload = describe() if callable(describe) else {}
+                judge_info.update(
+                    {
+                        "present": True,
+                        "enabled": bool(getattr(evaluator, "enabled", False)),
+                        "model": str(getattr(evaluator, "model_name", "") or ""),
+                        "injected_provider": bool(
+                            getattr(summarizer, "_evaluator_llm_client", None)
+                        ),
+                        "stats": dict(getattr(evaluator, "stats", {}) or {}),
+                    }
+                )
+                if isinstance(judge_payload, dict):
+                    judge_info.setdefault("llm_api_base_set", bool(judge_payload.get("api_base")))
+        except Exception as exc:
+            judge_info["error"] = str(exc)
+
+        # ---- 知识图谱 / 噪声过滤 ----
+        kg_info: Dict[str, Any] = {
+            "enabled": bool(getattr(summarizer, "graph_enabled", False)),
+            "triples_written": int(getattr(summarizer, "_stat_kg_triples", 0) or 0),
+        }
+        try:
+            noise = get_noise_filter()
+            kg_info["noise_filter"] = dict(getattr(noise, "stats", {}) or {})
+        except Exception:
+            kg_info["noise_filter"] = {}
+
+        # ---- 汇总降级结论 ----
+        degraded: List[str] = []
+        if not emb_info.get("powered"):
+            degraded.append("向量化降级（零向量，语义检索失效）")
+        if not rerank_info.get("powered"):
+            degraded.append("重排降级（本地 RRF）")
+        if not llm_info.get("powered"):
+            degraded.append("总结降级（规则抽取）")
+        if judge_info.get("present") and not judge_info.get("injected_provider"):
+            degraded.append("判官未绑定宿主服务商（依赖手填凭证或规则门禁）")
+        if not kg_info.get("enabled"):
+            degraded.append("知识图谱已关闭")
+
+        self_check = {
+            "checked_at": time.time(),
+            "all_powered": not degraded,
+            "degraded": degraded,
+            "embedding": emb_info,
+            "rerank": rerank_info,
+            "llm": llm_info,
+            "judge": judge_info,
+            "kg": kg_info,
+            "bindings": (
+                self.provider_bridge.load_bindings()
+                if self.provider_bridge is not None
+                else {}
+            ),
+        }
+        self._self_check = self_check
+        if self.provider_bridge is not None:
+            try:
+                self.provider_bridge.remember_status(**self_check)
+            except Exception:
+                pass
+        return self_check
+
+    def _log_self_check(self) -> None:
+        """把自检结果打成一行结构化日志，方便主人快速定位降级环节。"""
+        try:
+            check = self.build_self_check()
+            if check["all_powered"]:
+                logger.info("[agent_memory] 通电自检：全部组件已激活 ✅")
+            else:
+                logger.warning(
+                    "[agent_memory] 通电自检：存在降级 → %s",
+                    "；".join(check["degraded"]),
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.debug("[agent_memory] 自检日志输出失败（忽略）: %s", exc)
+
+    async def refresh_provider_bindings(self) -> Dict[str, Any]:
+        """
+        WebUI 保存服务商绑定后热重建 Embedding / Rerank / 总结链路。
+
+        说明：
+        - 只重建客户端并替换引用，不重启 Worker，不中断队列消费；
+        - 旧客户端持有 aiohttp 连接池，这里统一 close（失败忽略）；
+        - 若向量维度发生变化，提示需要重建索引（本方法不自动重建，避免长阻塞）。
+        """
+        result: Dict[str, Any] = {"rebuilt": False}
+        old_emb, old_rerank = self.embedding_client, self.rerank_client
+        old_dim = int(_safe_attr(old_emb, "dim", 0) or 0)
+
+        try:
+            new_emb = self._build_embedding_client()
+            new_rerank = self._build_rerank_client(new_emb)
+
+            self.embedding_client = new_emb
+            self.rerank_client = new_rerank
+            if self.retriever is not None:
+                self.retriever.embedding_client = new_emb
+                self.retriever.rerank_client = new_rerank
+            if self.summarizer is not None:
+                self.summarizer.embedding_client = new_emb
+                self.summarizer.rerank_client = new_rerank
+                # 重建总结/判官的宿主调用桩（服务商可能已切换）
+                summarizer_cfg = self._section("summarizer")
+                evaluator_cfg = self._section("evaluator")
+                chat_id = _first_non_empty(
+                    self.config.get("llm_provider_id"),
+                    summarizer_cfg.get("provider_id"),
+                    default="",
+                )
+                judge_id = _first_non_empty(
+                    evaluator_cfg.get("provider_id"),
+                    chat_id,
+                    default="",
+                )
+                if self.provider_bridge is not None:
+                    self.summarizer._llm_call = _make_llm_call(
+                        self.provider_bridge.build_chat_backend(str(chat_id))
+                    )
+                    judge_client = _make_llm_call(
+                        self.provider_bridge.build_chat_backend(str(judge_id))
+                    )
+                    self.summarizer._evaluator_llm_client = judge_client
+                    evaluator = getattr(self.summarizer, "evaluator", None)
+                    if evaluator is not None and judge_client is not None:
+                        evaluator._llm_client = judge_client
+
+            new_dim = int(_safe_attr(new_emb, "dim", 0) or 0)
+            if old_dim and new_dim and old_dim != new_dim:
+                result["warning"] = (
+                    f"向量维度已从 {old_dim} 变为 {new_dim}，"
+                    "既有向量与新维度不兼容，建议执行 /memory 重建索引后再检索。"
+                )
+                logger.warning("[agent_memory] %s", result["warning"])
+
+            result.update({"rebuilt": True, "self_check": self.build_self_check()})
+        except Exception as exc:
+            logger.error("[agent_memory] 热重建服务商后端失败: %s", exc, exc_info=True)
+            result["error"] = str(exc)
+            # 保持原对象不变，避免把插件置于半成品状态
+            self.embedding_client, self.rerank_client = old_emb, old_rerank
+        finally:
+            for client in (old_emb, old_rerank):
+                closer = getattr(client, "close", None)
+                if callable(closer):
+                    try:
+                        maybe = closer()
+                        if asyncio.iscoroutine(maybe):
+                            await maybe
+                    except Exception:
+                        pass
+        return result
+
+
+    # ------------------------------------------------------------------
+    # P0：噪声过滤开关（遵循 noise_filter 配置组）
+    # ------------------------------------------------------------------
+    def _noise_guard(
+        self, user_text: str, bot_text: str
+    ) -> tuple[str, str, bool]:
+        """
+        统一的噪声拦截入口。
+
+        返回 ``(clean_user, clean_bot, dropped)``：
+        - ``dropped=True`` 表示整轮都是系统噪声，调用方应直接丢弃；
+        - ``noise_filter.enabled=False`` 时完全直通（保留旧行为，便于排障）；
+        - ``noise_filter.strip_inline=False`` 时只做「整段丢弃」不做「行内清洗」。
+        """
+        section = self._section("noise_filter")
+        if not bool(section.get("enabled", True)):
+            return user_text, bot_text, False
+        try:
+            clean_user, clean_bot, meta = filter_turn(user_text, bot_text)
+            if meta.get("is_noise"):
+                return "", "", True
+            if not bool(section.get("strip_inline", True)):
+                return user_text, bot_text, False
+            return clean_user, clean_bot, False
+        except Exception as exc:  # pragma: no cover - 过滤器异常绝不阻断
+            logger.debug("[agent_memory] 噪声过滤异常（忽略）: %s", exc)
+            return user_text, bot_text, False
 
     # ------------------------------------------------------------------
     # 生命周期钩子
@@ -894,6 +1313,19 @@ class AgentMemoryPlugin(Star):
         换来“未满 N 轮即断电/重启也不丢原始对话”的强持久化保证（R-02）。
         """
         if not self.enable_memory or self.summarizer is None:
+            return False
+
+        # ---- P0：系统噪声拦截（钩子入口第一道闸）----
+        # 宿主 / 子代理 / 其它插件会把系统块注入到 user 或 assistant 文本中，
+        # 这里先做整体判定：整轮都是噪声直接丢弃，避免进入缓冲池与 L1。
+        user_text, bot_text, dropped = self._noise_guard(user_text, bot_text)
+        if dropped:
+            logger.debug(
+                "[agent_memory] record_turn 丢弃系统噪声轮次 | session=%s", session_id
+            )
+            return False
+
+        if not str(user_text or "").strip() and not str(bot_text or "").strip():
             return False
 
         # 兼容 initialize() 未被宿主调用的场景：首次写入时惰性启动 Worker
@@ -1019,6 +1451,34 @@ class AgentMemoryPlugin(Star):
                 status["engine"] = engine
         except Exception as exc:
             logger.debug("[agent_memory] 获取引擎状态失败: %s", exc)
+
+        # ---- P0：通电自检 / 噪声过滤 / 服务商绑定 ----
+        try:
+            status["self_check"] = self.build_self_check()
+        except Exception as exc:
+            logger.debug("[agent_memory] 通电自检失败: %s", exc)
+            status["self_check"] = getattr(self, "_self_check", {}) or {}
+        try:
+            noise = get_noise_filter()
+            status["noise"] = {
+                "stats": dict(getattr(noise, "stats", {}) or {}),
+                "recent": noise.recent(5),
+            }
+        except Exception as exc:
+            logger.debug("[agent_memory] 噪声统计失败: %s", exc)
+        if self.provider_bridge is not None:
+            try:
+                status["provider_bindings"] = self.provider_bridge.load_bindings()
+            except Exception:
+                status["provider_bindings"] = {}
+        try:
+            status["webui"] = {
+                "page": "dashboard",
+                "api_prefix": f"/api/v1/plugins/extensions/{PLUGIN_NAME}/page",
+                "routes_registered": len(getattr(getattr(self, "page_api", None), "ROUTES", ()) or ()),
+            }
+        except Exception:
+            pass
         return status
 
     # ------------------------------------------------------------------
@@ -1267,6 +1727,20 @@ class AgentMemoryPlugin(Star):
                 self._hook_stats["record_skip"] += 1
                 return False
 
+            # ---- P0：系统噪声拦截（后置钩子入口）----
+            # 典型噪声：子代理后台任务回调、项目大盘、RAG 注入块、system_reminder 等。
+            # 放在指纹计算之前，避免噪声轮次污染去重窗口。
+            user_text, bot_text, dropped = self._noise_guard(user_text, bot_text)
+            if dropped:
+                self._hook_stats["record_skip"] += 1
+                logger.debug(
+                    "[agent_memory] 轮次为系统噪声，已跳过 | session=%s", session_id
+                )
+                return False
+            if not user_text and not bot_text:
+                self._hook_stats["record_skip"] += 1
+                return False
+
             fingerprint = (user_text, bot_text)
             if self._should_skip_record(session_id, fingerprint):
                 self._hook_stats["record_skip"] += 1
@@ -1311,31 +1785,38 @@ class AgentMemoryPlugin(Star):
         """
         探测 Embedding / Rerank 模型连接的可用性。
 
-        判定口径：
-        - 未装配 → present=False
-        - 已装配但未配置 api_key → 客户端会走本地降级（零向量 / RRF），视为 unhealthy
-        - 已装配且有 api_key → healthy=True（真实连通性由运行时请求兜底，此处不做网络探测）
+        P0 口径修正：改为复用 ``build_self_check()`` 的判定，
+        即「宿主 Provider 已绑定」或「手填 api_key 存在」都算健康，
+        不再单纯以 api_key 是否为空作为唯一标准（否则服务商模式永远误报不健康）。
         """
-        emb = self.embedding_client
-        rerank = self.rerank_client
-
-        emb_key = str(_safe_attr(emb, "api_key", "") or "").strip()
-        rerank_key = str(_safe_attr(rerank, "api_key", "") or "").strip()
-
-        return {
-            "embedding": {
-                "present": emb is not None,
-                "has_key": bool(emb_key),
-                "model": str(_safe_attr(emb, "model", "") or ""),
-                "healthy": emb is not None and bool(emb_key),
-            },
-            "rerank": {
-                "present": rerank is not None,
-                "has_key": bool(rerank_key),
-                "model": str(_safe_attr(rerank, "model", "") or ""),
-                "healthy": rerank is not None and bool(rerank_key),
-            },
-        }
+        try:
+            check = self.build_self_check()
+            return {
+                "embedding": {
+                    "present": bool(check["embedding"].get("present")),
+                    "has_key": bool(
+                        check["embedding"].get("powered")
+                    ),
+                    "model": str(check["embedding"].get("model", "")),
+                    "healthy": bool(check["embedding"].get("powered")),
+                    "mode": str(check["embedding"].get("mode", "none")),
+                    "provider_id": str(check["embedding"].get("provider_id", "")),
+                },
+                "rerank": {
+                    "present": bool(check["rerank"].get("present")),
+                    "has_key": bool(check["rerank"].get("powered")),
+                    "model": str(check["rerank"].get("model", "")),
+                    "healthy": bool(check["rerank"].get("powered")),
+                    "mode": str(check["rerank"].get("mode", "none")),
+                    "provider_id": str(check["rerank"].get("provider_id", "")),
+                },
+            }
+        except Exception as exc:  # pragma: no cover - 状态查询零崩溃要求
+            logger.debug("[agent_memory] 组件健康度探测失败（忽略）: %s", exc)
+            return {
+                "embedding": {"present": self.embedding_client is not None, "healthy": False},
+                "rerank": {"present": self.rerank_client is not None, "healthy": False},
+            }
 
     async def cmd_status(self, event: Any = None) -> str:
         """/memory status：输出分层记忆体量、注入策略、模型健康度与钩子统计。"""

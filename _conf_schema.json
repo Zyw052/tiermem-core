@@ -1,224 +1,436 @@
 {
   "enable_memory": {
-    "description": "启用分层记忆系统",
+    "description": "启用分层记忆",
     "type": "bool",
     "default": true,
-    "hint": "全局开关，控制是否启用 L1/L2/L3 记忆自动召回与归档"
-  },
-  "db_path": {
-    "description": "记忆数据库文件路径",
-    "type": "string",
-    "default": "",
-    "hint": "留空则使用 <AstrBot数据目录>/plugin_data/astrbot_plugin_agent_memory/agent_memory.db；也可填写完整 .db 文件路径或目录"
-  },
-  "summary_turn_interval": {
-    "description": "多轮缓冲总结阈值（轮）",
-    "type": "int",
-    "default": 5,
-    "hint": "同一会话累积 N 轮对话后才打包触发一次后台总结，减少 LLM 调用；会话结束或插件关闭时会强制冲洗剩余轮次"
+    "hint": "总开关：L1 原始对话落盘、L2 情景记忆、L3 图谱与自动召回。"
   },
   "memory_injection_enable": {
-    "description": "启用记忆前置注入（Prompt Injection）",
+    "description": "启用记忆注入",
     "type": "bool",
     "default": true,
-    "hint": "关闭后 LLM 请求不再被注入长期记忆，但轮次沉淀（后置记录）仍然生效"
+    "hint": "开启后每轮对话前检索长期记忆并注入提示词；关闭仅保留沉淀，不再注入。"
+  },
+  "summary_turn_interval": {
+    "description": "总结触发轮次",
+    "type": "int",
+    "default": 5,
+    "slider": {
+      "min": 1,
+      "max": 20,
+      "step": 1
+    },
+    "hint": "同一会话累积 N 轮后打包做一次后台总结，减少 LLM 调用。建议 3~8。"
+  },
+  "llm_provider_id": {
+    "description": "总结模型服务商",
+    "type": "string",
+    "_special": "select_provider",
+    "default": "",
+    "hint": "直接下拉选择 AstrBot 已配置的对话服务商，用于后台记忆提炼；留空则回退下方「总结模型」手动配置。"
+  },
+  "embedding_provider_id": {
+    "description": "向量化服务商 ID",
+    "type": "string",
+    "default": "",
+    "hint": "填写 AstrBot「服务提供商」中 Embedding 类型服务的 ID（可打开本插件「记忆面板」页面用下拉框挑选）。留空则回退手动 API 配置，再退化为零向量。"
+  },
+  "rerank_provider_id": {
+    "description": "重排服务商 ID",
+    "type": "string",
+    "default": "",
+    "hint": "填写 Rerank 类型服务的 ID（同样可在「记忆面板」页面下拉挑选）。留空则回退本地 RRF 融合重排。"
+  },
+  "judge_provider_id": {
+    "description": "判官模型服务商",
+    "type": "string",
+    "_special": "select_provider",
+    "default": "",
+    "hint": "自作判定门禁（信息价值打分 / 冲突检测）使用。建议选廉价快速模型；留空则复用总结模型服务商。"
+  },
+  "db_path": {
+    "description": "记忆数据库路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空使用插件数据目录下的 agent_memory.db；可填完整 .db 路径或目录。"
   },
   "summarizer_queue_maxsize": {
-    "description": "后台总结队列最大容量",
+    "description": "总结队列容量",
     "type": "int",
     "default": 1000,
-    "hint": "队列满时降级写入 task_dlq 死信表，绝不阻塞主对话链路"
+    "invisible": true
   },
   "summary_idle_flush_seconds": {
-    "description": "会话静默超时刷盘阈值（秒）",
+    "description": "会话静默刷盘阈值(秒)",
     "type": "int",
     "default": 180,
-    "hint": "会话在该时长内无新轮次时，自动把缓冲池中的尾部轮次打包析出，避免记忆滞留内存；0 表示关闭"
+    "invisible": true
   },
-  "summarizer": {
-    "description": "独立总结与提炼模型配置",
+  "retrieval": {
+    "description": "检索与注入",
+    "hint": "召回条数、注入位置与注入长度上限；其余高级参数已隐藏，可在「记忆面板」页面查看与调优。",
     "type": "object",
     "items": {
-      "provider_id": {
-        "description": "LLM 提供商 ID (留空则复用当前会话模型)",
-        "type": "string",
-        "default": "",
-        "hint": "建议配置轻量高性价比模型用于后台 L1/L2/L3 记忆提炼"
-      },
-      "embedding_provider_id": {
-        "description": "Embedding 提供商 ID",
-        "type": "string",
-        "default": "",
-        "hint": "用于 L2 情景记忆向量化检索"
-      },
-      "max_concurrency": {
-        "description": "后台总结最大并发数",
+      "top_k": {
+        "description": "单次召回条数",
         "type": "int",
-        "default": 2
+        "default": 6,
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        },
+        "hint": "每次注入最多带入多少条记忆，建议 4~8。"
       },
-      "timeout_seconds": {
-        "description": "总结请求超时时间(秒)",
+      "inject_position": {
+        "description": "注入位置",
+        "type": "string",
+        "default": "system_head",
+        "options": [
+          "system_head",
+          "system_tail",
+          "user_head"
+        ],
+        "hint": "system_head=系统提示最前；system_tail=人设之后；user_head=用户提问最前。"
+      },
+      "prompt_injection_max_chars": {
+        "description": "注入字符上限",
         "type": "int",
-        "default": 45
+        "default": 2000,
+        "slider": {
+          "min": 0,
+          "max": 8000,
+          "step": 100
+        },
+        "hint": "0 表示不限制；过大可能挤占人格提示词。"
       },
-      "summary_turn_interval": {
-        "description": "多轮缓冲总结阈值(轮)",
-        "type": "int",
-        "default": 5,
-        "hint": "与顶层配置等效，顶层优先；建议 3~8 轮"
+      "weight_vector": {
+        "description": "向量权重",
+        "type": "float",
+        "default": 0.55,
+        "invisible": true
       },
-      "api_base": {
-        "description": "总结 LLM API 地址(OpenAI 兼容)",
-        "type": "string",
-        "default": ""
+      "weight_bm25": {
+        "description": "BM25 权重",
+        "type": "float",
+        "default": 0.3,
+        "invisible": true
       },
-      "api_key": {
-        "description": "总结 LLM API 密钥",
-        "type": "string",
-        "default": ""
+      "weight_importance": {
+        "description": "重要度权重",
+        "type": "float",
+        "default": 0.15,
+        "invisible": true
       },
-      "model": {
-        "description": "总结 LLM 模型名称",
-        "type": "string",
-        "default": ""
+      "retrieve_timeout": {
+        "description": "检索超时(秒)",
+        "type": "float",
+        "default": 3.0,
+        "invisible": true
       },
-      "dlq_retry_enabled": {
-        "description": "启用死信队列自动重试（方案B闭环）",
+      "record_dedup_window": {
+        "description": "轮次去重窗口(秒)",
+        "type": "float",
+        "default": 2.0,
+        "invisible": true
+      },
+      "strict_session_isolation": {
+        "description": "严格会话隔离",
         "type": "bool",
         "default": true,
-        "hint": "开启后后台守护会定期扫描 task_dlq 中到期的 pending 任务并重新消费，形成闭环"
+        "invisible": true
       },
-      "dlq_retry_interval": {
-        "description": "死信队列巡检间隔(秒)",
+      "access_flush_interval": {
+        "description": "访问计数刷盘间隔(秒)",
         "type": "float",
         "default": 60.0,
-        "hint": "每隔 N 秒扫描一次到期死信；建议 30~300 秒"
+        "invisible": true
       },
-      "dlq_batch_size": {
-        "description": "单轮巡检最大处理死信条数",
+      "access_flush_threshold": {
+        "description": "访问计数刷盘阈值",
         "type": "int",
-        "default": 10,
-        "hint": "控制单次巡检的消费量，避免重试风暴占用队列"
+        "default": 200,
+        "invisible": true
       },
-      "dlq_base_backoff": {
-        "description": "死信重试退避基数(秒)",
-        "type": "float",
-        "default": 60.0,
-        "hint": "指数退避：第 n 次重试等待 base * 2^(n-1) 秒"
-      },
-      "dlq_max_backoff": {
-        "description": "死信重试退避上限(秒)",
-        "type": "float",
-        "default": 3600.0,
-        "hint": "指数退避的封顶值，防止等待时间无限增长"
-      },
-      "dlq_max_retries": {
-        "description": "死信最大重试次数",
+      "recall_pool_limit": {
+        "description": "粗排候选池上限",
         "type": "int",
-        "default": 3,
-        "hint": "达到该次数后任务标记为 failed 终态，不再重试"
+        "default": 500,
+        "invisible": true
+      },
+      "matrix_cache_sync_interval": {
+        "description": "向量矩阵校验间隔(秒)",
+        "type": "float",
+        "default": 5.0,
+        "invisible": true
+      },
+      "graph_recall_enabled": {
+        "description": "启用图谱关联召回",
+        "type": "bool",
+        "default": true,
+        "invisible": true
+      },
+      "graph_entity_limit": {
+        "description": "图谱种子实体上限",
+        "type": "int",
+        "default": 5,
+        "invisible": true
+      },
+      "graph_edge_limit": {
+        "description": "图谱关联边上限",
+        "type": "int",
+        "default": 20,
+        "invisible": true
+      },
+      "graph_score_bonus": {
+        "description": "图谱关联加分",
+        "type": "float",
+        "default": 0.15,
+        "invisible": true
+      },
+      "decay_enabled": {
+        "description": "启用时间衰减",
+        "type": "bool",
+        "default": true,
+        "invisible": true
+      },
+      "decay_lambda": {
+        "description": "衰减速率 λ",
+        "type": "float",
+        "default": 1.0,
+        "invisible": true
+      },
+      "decay_floor": {
+        "description": "衰减下限",
+        "type": "float",
+        "default": 0.05,
+        "invisible": true
+      },
+      "max_pinned_l3": {
+        "description": "置顶记忆注入上限",
+        "type": "int",
+        "default": 15,
+        "invisible": true
       }
     }
   },
   "evaluator": {
-    "description": "自作判定门禁（廉价模型预判定）",
+    "description": "自作判定门禁",
+    "hint": "入库前用廉价模型给事实打信息价值分并检测冲突；失败自动降级为本地规则，不会阻断记忆主链路。",
     "type": "object",
     "items": {
       "enable": {
-        "description": "启用自作判定门禁",
+        "description": "启用判定门禁",
         "type": "bool",
-        "default": true,
-        "hint": "在 L2 原子事实入库前用廉价模型做一轮信息价值打分与冲突检测；关闭则原样入库"
+        "default": true
       },
       "model_name": {
         "description": "判官模型名称",
         "type": "string",
         "default": "jev",
-        "hint": "主人指定默认 jev；留空则回退为总结模型（summarizer.model）"
+        "hint": "主人指定默认 jev；实际模型以所选服务商为准，此处用于日志与提示。"
       },
       "api_base": {
-        "description": "判官模型 API 地址(OpenAI 兼容)",
+        "description": "判官 API 地址",
         "type": "string",
         "default": "",
-        "hint": "留空则自动回退复用 summarizer.api_base"
+        "invisible": true
       },
       "api_key": {
-        "description": "判官模型 API 密钥",
+        "description": "判官 API 密钥",
         "type": "string",
         "default": "",
-        "hint": "留空则自动回退复用 summarizer.api_key"
+        "invisible": true
       },
       "timeout_seconds": {
-        "description": "判官请求超时(秒)",
+        "description": "判官超时(秒)",
         "type": "float",
         "default": 8.0,
-        "hint": "超时即平滑降级为本地规则判定，绝不阻断记忆主链路"
+        "invisible": true
       },
       "min_value_score": {
-        "description": "信息价值过滤阈值",
+        "description": "价值分阈值",
         "type": "float",
         "default": 0.35,
-        "hint": "value_score 低于该值的事实被丢弃（寒暄/低价值废话）；建议 0.3~0.5"
+        "invisible": true
       },
       "fallback_min_value_score": {
-        "description": "降级状态下的过滤阈值",
+        "description": "降级阈值",
         "type": "float",
         "default": 0.175,
-        "hint": "判官模型失败时使用的更宽松阈值，保证不误伤有效记忆"
+        "invisible": true
       },
       "conflict_check": {
-        "description": "启用事实冲突与推翻检测",
+        "description": "冲突检测",
         "type": "bool",
         "default": true,
-        "hint": "识别与旧事实矛盾的新事实，并把旧原子标记为 superseded 软废弃"
+        "invisible": true
       },
       "conflict_similarity": {
-        "description": "冲突判定相似度下限",
+        "description": "冲突相似度下限",
         "type": "float",
         "default": 0.5,
-        "hint": "新旧事实字符二元组 Jaccard 相似度达到该值才进入冲突判定"
+        "invisible": true
       },
       "max_candidates": {
-        "description": "单次判官比对的候选事实上限",
+        "description": "冲突比对候选数",
         "type": "int",
         "default": 8,
-        "hint": "过大会增加判官 token 开销，建议 5~12"
+        "invisible": true
       },
       "fail_open": {
-        "description": "判官失败时保留事实(fail-open)",
+        "description": "失败时保留事实",
         "type": "bool",
         "default": true,
-        "hint": "开启则降级时仍尽量入库；关闭则严格按规则阈值过滤"
+        "invisible": true
       }
     }
   },
   "graph": {
-    "description": "L3 知识图谱抽取（方案 C）",
+    "description": "知识图谱（L3）",
+    "hint": "从记忆中抽取 (主体, 关系, 客体) 三元组，支撑多跳关联召回。",
     "type": "object",
     "items": {
       "enable": {
-        "description": "启用知识图谱三元组抽取",
+        "description": "启用图谱抽取",
         "type": "bool",
         "default": true,
-        "hint": "开启后总结阶段会自动抽取 (head, relation, tail) 三元组并写入 kg_nodes/kg_edges；关闭则零图谱副作用"
+        "hint": "关闭后不再写入 kg_nodes / kg_edges，检索侧图路召回同步失效。"
       },
       "max_triples_per_fact": {
-        "description": "单条事实最大三元组条数",
+        "description": "单事实三元组上限",
         "type": "int",
         "default": 6,
-        "hint": "防止长文本过度抽取导致图谱膨胀，建议 4~8"
+        "invisible": true
       },
       "edge_confidence": {
-        "description": "规则抽取关系的置信度",
+        "description": "规则关系置信度",
         "type": "float",
         "default": 0.9,
-        "hint": "规则抽取的可解释性高，默认 0.9；模型给出的结构化三元组同样以此为下限"
+        "invisible": true
+      }
+    }
+  },
+  "noise_filter": {
+    "description": "系统噪声过滤",
+    "hint": "拦截注入到会话里的系统块与后台回调（子代理任务完成、项目大盘、RAG 标记、system_reminder 等），避免污染长期记忆。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用噪声过滤",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后系统块会被当作正常对话写入记忆（不建议）。"
+      },
+      "strip_inline": {
+        "description": "清洗行内噪声",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后不仅整段丢弃，还会把夹杂在正常文本中的系统块剔除，只保留有效内容。"
+      }
+    }
+  },
+  "webui": {
+    "description": "记忆面板（插件页面）",
+    "hint": "在 AstrBot「插件」页打开本插件页面即可查看通电自检、L1/L2/KG/DLQ 统计、记忆浏览与噪声排查。",
+    "type": "object",
+    "items": {
+      "register_api": {
+        "description": "注册页面数据接口",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后插件页面仍可打开，但数据接口返回 404。改动需重载插件生效。"
+      }
+    }
+  },
+  "summarizer": {
+    "description": "总结模型（手动配置兜底）",
+    "hint": "仅当上方「总结模型服务商」留空时使用；已选服务商时这里的配置不会覆盖服务商。",
+    "type": "object",
+    "invisible": true,
+    "items": {
+      "provider_id": {
+        "description": "LLM 服务商 ID",
+        "type": "string",
+        "default": ""
+      },
+      "embedding_provider_id": {
+        "description": "Embedding 服务商 ID",
+        "type": "string",
+        "default": ""
+      },
+      "rerank_provider_id": {
+        "description": "Rerank 服务商 ID",
+        "type": "string",
+        "default": ""
+      },
+      "max_concurrency": {
+        "description": "后台总结并发数",
+        "type": "int",
+        "default": 2
+      },
+      "timeout_seconds": {
+        "description": "总结超时(秒)",
+        "type": "int",
+        "default": 45
+      },
+      "summary_turn_interval": {
+        "description": "总结触发轮次(兼容旧键)",
+        "type": "int",
+        "default": 5
+      },
+      "api_base": {
+        "description": "手动 API 地址",
+        "type": "string",
+        "default": ""
+      },
+      "api_key": {
+        "description": "手动 API 密钥",
+        "type": "string",
+        "default": ""
+      },
+      "model": {
+        "description": "手动模型名称",
+        "type": "string",
+        "default": ""
+      },
+      "dlq_retry_enabled": {
+        "description": "死信自动重试",
+        "type": "bool",
+        "default": true
+      },
+      "dlq_retry_interval": {
+        "description": "死信巡检间隔(秒)",
+        "type": "float",
+        "default": 60.0
+      },
+      "dlq_batch_size": {
+        "description": "单轮死信处理条数",
+        "type": "int",
+        "default": 10
+      },
+      "dlq_base_backoff": {
+        "description": "死信退避基数(秒)",
+        "type": "float",
+        "default": 60.0
+      },
+      "dlq_max_backoff": {
+        "description": "死信退避上限(秒)",
+        "type": "float",
+        "default": 3600.0
+      },
+      "dlq_max_retries": {
+        "description": "死信最大重试次数",
+        "type": "int",
+        "default": 3
       }
     }
   },
   "models": {
-    "description": "向量化与重排模型配置",
+    "description": "手动向量化与重排模型",
+    "hint": "仅当未选择宿主 Embedding / Rerank 服务商时生效（服务商优先）。",
     "type": "object",
+    "invisible": true,
     "items": {
       "embedding": {
         "description": "Embedding 模型",
@@ -227,7 +439,7 @@
           "api_base": {
             "description": "API 地址",
             "type": "string",
-            "default": "https://api.siliconflow.cn/v1"
+            "default": ""
           },
           "api_key": {
             "description": "API 密钥",
@@ -252,13 +464,13 @@
         }
       },
       "rerank": {
-        "description": "重排模型",
+        "description": "Rerank 模型",
         "type": "object",
         "items": {
           "api_base": {
             "description": "API 地址",
             "type": "string",
-            "default": "https://api.siliconflow.cn/v1"
+            "default": ""
           },
           "api_key": {
             "description": "API 密钥",
@@ -276,7 +488,7 @@
             "default": 20.0
           },
           "rrf_k": {
-            "description": "RRF 融合常数 k",
+            "description": "RRF 常数 k",
             "type": "int",
             "default": 60
           }
@@ -284,180 +496,30 @@
       }
     }
   },
-  "retrieval": {
-    "description": "混合检索与权重参数",
-    "type": "object",
-    "items": {
-      "top_k": {
-        "description": "单次召回最大记忆条数",
-        "type": "int",
-        "default": 6
-      },
-      "weight_vector": {
-        "description": "向量语义相似度权重",
-        "type": "float",
-        "default": 0.55
-      },
-      "weight_bm25": {
-        "description": "BM25 关键词检索权重",
-        "type": "float",
-        "default": 0.3
-      },
-      "weight_importance": {
-        "description": "重要度与时间衰减权重",
-        "type": "float",
-        "default": 0.15
-      },
-      "retrieve_timeout": {
-        "description": "前置检索最大等待时长（秒）",
-        "type": "float",
-        "default": 3.0,
-        "hint": "超时即静默降级跳过本次注入，绝不拖慢主对话链路"
-      },
-      "prompt_injection_max_chars": {
-        "description": "注入 System Prompt 的记忆块字符上限",
-        "type": "int",
-        "default": 2000,
-        "hint": "0 表示不限制；超长会被截断，避免挤占人格提示词"
-      },
-      "inject_position": {
-        "description": "记忆块注入位置",
-        "type": "string",
-        "default": "system_head",
-        "hint": "system_head=System Prompt 最前端（默认，推荐 Claude/GPT-4o）；system_tail=System Prompt 最末端（紧贴人设之后）；user_head=用户 Query 最前端（推荐 DeepSeek/Qwen 等对即时提问敏感的模型）"
-      },
-      "record_dedup_window": {
-        "description": "轮次记录去重时间窗（秒）",
-        "type": "float",
-        "default": 2.0,
-        "hint": "同一会话相同内容在该窗口内只记录一次，抵御宿主重复回调"
-      },
-      "strict_session_isolation": {
-        "description": "严格会话隔离（默认开启）",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后只召回本会话记忆；仅当记忆 scope_key='global' 时才允许跨群/私聊全局召回，物理杜绝串台"
-      },
-      "access_flush_interval": {
-        "description": "访问计数异步刷盘间隔（秒）",
-        "type": "float",
-        "default": 60.0,
-        "hint": "检索命中计数先在内存累加，按此间隔异步刷盘，保证检索链路纯读不抢 SQLite 写锁"
-      },
-      "access_flush_threshold": {
-        "description": "访问计数刷盘条数阈值",
-        "type": "int",
-        "default": 200,
-        "hint": "内存中累计的访问计数达到该条数时立即触发一次异步刷盘"
-      },
-      "recall_pool_limit": {
-        "description": "向量/关键词粗排候选池上限（条）",
-        "type": "int",
-        "default": 500,
-        "hint": "第一阶段召回从最近 N 条记忆中粗排；千级记忆建议保持 500~1000"
-      },
-      "matrix_cache_sync_interval": {
-        "description": "向量矩阵缓存一致性校验间隔（秒）",
-        "type": "float",
-        "default": 5.0,
-        "hint": "方案B内存向量矩阵缓存：定期比对数据库指纹以感知外部写入；0 表示每次检索都校验（牺牲少量性能换绝对一致）"
-      },
-      "graph_recall_enabled": {
-        "description": "启用图谱 1-hop 关联召回",
-        "type": "bool",
-        "default": true,
-        "hint": "query 命中图谱实体时，沿 kg_edges 召回 1-hop 关联记忆并注入候选池（多跳解释能力）"
-      },
-      "graph_entity_limit": {
-        "description": "图谱种子实体上限",
-        "type": "int",
-        "default": 5,
-        "hint": "单次检索最多匹配多少个实体节点作为 1-hop 展开种子"
-      },
-      "graph_edge_limit": {
-        "description": "图谱关联边上限",
-        "type": "int",
-        "default": 20,
-        "hint": "1-hop 展开时最多取多少条活跃关联边，避免大图拖慢检索"
-      },
-      "graph_score_bonus": {
-        "description": "图谱关联加分权重",
-        "type": "float",
-        "default": 0.15,
-        "hint": "图谱命中项在粗排融合分上的加成系数，0 表示仅入池不加分"
-      },
-      "decay_enabled": {
-        "description": "启用艾宾浩斯时间衰减",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后精排得分乘以时间衰减系数，让陈旧琐事自然让位于新鲜上下文"
-      },
-      "decay_lambda": {
-        "description": "衰减速率 λ",
-        "type": "float",
-        "default": 1.0,
-        "hint": "Score=Score×exp(-λ·Δt/ttl_days)；λ=1 表示过满 ttl 后衰减到约 36.8%"
-      },
-      "decay_floor": {
-        "description": "衰减系数下限",
-        "type": "float",
-        "default": 0.05,
-        "hint": "防止极旧记忆被压到 0 后彻底无法召回；0 表示不设下限"
-      }
-    }
-  },
   "migration": {
-    "description": "旧记忆资产迁移配置",
+    "description": "旧记忆资产迁移",
     "type": "object",
+    "invisible": true,
     "items": {
       "auto_detect_legacy": {
-        "description": "启动时自动检测旧插件记忆资产",
+        "description": "自动检测旧资产",
         "type": "bool",
         "default": true
       },
       "source_db_path": {
-        "description": "旧版 livingmemory.db 路径",
+        "description": "旧库路径",
         "type": "string",
-        "default": "",
-        "hint": "留空则自动探测 astrbot_plugin_livingmemory 插件数据目录下的 livingmemory.db"
+        "default": ""
       },
       "force": {
-        "description": "目标库非空时仍强制迁移",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后 /memory migrate 会覆盖合并写入已有数据，请谨慎使用"
-      },
-      "dry_run": {
-        "description": "仅预览迁移统计不写入",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后 /memory migrate 只做只读统计，不修改目标库"
-      }
-    }
-  },
-  "webui": {
-    "description": "专属记忆管理 WebUI 配置",
-    "type": "object",
-    "items": {
-      "enable": {
-        "description": "启用专属 WebUI 面板",
+        "description": "强制覆盖迁移",
         "type": "bool",
         "default": false
       },
-      "host": {
-        "description": "监听地址",
-        "type": "string",
-        "default": "127.0.0.1"
-      },
-      "port": {
-        "description": "监听端口",
-        "type": "int",
-        "default": 18899
-      },
-      "access_token": {
-        "description": "WebUI 访问令牌",
-        "type": "string",
-        "default": ""
+      "dry_run": {
+        "description": "仅预览不写入",
+        "type": "bool",
+        "default": false
       }
     }
   }
