@@ -24,11 +24,28 @@ from storage import MemoryStorage
 
 logger = logging.getLogger("astrbot_plugin_agent_memory.migrator")
 
-DEFAULT_SOURCE_DB = Path(
-    "/AstrBot/data/plugin_data/astrbot_plugin_livingmemory/livingmemory.db"
+def _env_path(env_key: str, fallback: str) -> Path:
+    """优先读取环境变量，未设置时回退到内置默认路径。
+
+    这样既保持「零配置直接可跑」的原有默认行为（环境变量未设置时
+    结果与硬编码路径完全一致），又允许非 ``/AstrBot`` 标准部署的宿主
+    通过环境变量覆盖，避免把安装路径写死在开源代码里。
+
+    支持的变量：
+        - ``ASTRBOT_LIVINGMEMORY_DB``   : 旧版 livingmemory.db 绝对路径
+        - ``ASTRBOT_AGENT_MEMORY_DIR``  : 新版插件数据目录绝对路径
+    """
+    raw = os.environ.get(env_key, "").strip()
+    return Path(raw) if raw else Path(fallback)
+
+
+DEFAULT_SOURCE_DB = _env_path(
+    "ASTRBOT_LIVINGMEMORY_DB",
+    "/AstrBot/data/plugin_data/astrbot_plugin_livingmemory/livingmemory.db",
 )
-DEFAULT_TARGET_DIR = Path(
-    "/AstrBot/data/plugin_data/astrbot_plugin_agent_memory"
+DEFAULT_TARGET_DIR = _env_path(
+    "ASTRBOT_AGENT_MEMORY_DIR",
+    "/AstrBot/data/plugin_data/astrbot_plugin_agent_memory",
 )
 
 

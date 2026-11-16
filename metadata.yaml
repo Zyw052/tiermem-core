@@ -1,8 +1,8 @@
 name: astrbot_plugin_agent_memory
-desc: 智涌原生分层记忆插件（L1 原始对话 / L2 情景记忆 / L3 知识图谱，服务商选择器直连宿主 Provider + 内置记忆面板 WebUI + 系统噪声过滤）
+desc: 零容器轻量分层长期记忆内核（L1 工作窗口 / L2 情景记忆 + superseded 演化链 / L3 时序知识图谱；单 SQLite 文件部署，内置记忆面板 WebUI，宿主 Provider 直连 + 系统噪声过滤 + 死信队列闭环）
 version: 1.1.0
-author: Vivian & Master
-repo: ""
+author: Zyw052
+repo: "https://github.com/Zyw052/tiermem-core"
 views:
   - name: dashboard
     title: 记忆面板
