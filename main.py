@@ -538,20 +538,69 @@ class AgentMemoryPlugin(Star):
         except Exception as exc:  # pragma: no cover
             logger.debug("[agent_memory] 热更新 enable_injection 失败（忽略）: %s", exc)
         try:
-            self.turn_interval = _safe_int(
-                cfg.get("summary_turn_interval"), self.turn_interval, minimum=1
-            )
-            applied.append("turn_interval")
+            # 复用 summarizer 的严格校验：非法值（非数字 / <=0）保持原值不变，
+            # 避免 `_safe_int(minimum=1)` 把 0 这类脏值钳成 1 而悄悄改窄窗口。
+            raw_interval = cfg.get("summary_turn_interval")
+            candidate = MemorySummarizer._coerce_turn_interval(raw_interval)
+            if raw_interval in (None, "") or candidate is not None:
+                if candidate is not None:
+                    self.turn_interval = candidate
+                    applied.append("turn_interval")
+                # 【修复】窗口阈值必须同步回写总结 Worker，否则面板改值只更新了
+                # 插件层的 self.turn_interval，已构建的 summarizer 仍用旧阈值判定，
+                # 表现为「配置改了但总结窗口不变」的假热更。
+                self._apply_turn_interval_to_summarizer()
+            else:
+                # 显式提交了非法值：不改动运行窗口，也不谎报「已生效」
+                logger.warning(
+                    "[agent_memory] 忽略非法 summary_turn_interval=%r，保持 %d 轮",
+                    raw_interval,
+                    self.turn_interval,
+                )
         except Exception as exc:  # pragma: no cover
             logger.debug("[agent_memory] 热更新 turn_interval 失败（忽略）: %s", exc)
         # 检索/注入参数每次请求都从 self.config 现读，此处仅显式标注已生效
         for section in ("retrieval", "noise_filter", "graph", "evaluator"):
             if isinstance(cfg.get(section), dict):
                 applied.append(f"{section}.*")
-        skipped.extend(
-            ["db_path", "summarizer.*", "models.*", "migration.*", "webui.register_api"]
-        )
+        # 语义对齐 RELOAD_REQUIRED_PREFIXES：summarizer 节点下只有窗口阈值可热更，
+        # 其余（provider / model / 凭证 / DLQ 参数）需插件重载，这里精确列出，
+        # 避免「说全跳过」却实际已热更 summary_turn_interval 的自相矛盾。
+        skipped.extend(["db_path", "models.*", "migration.*", "webui.register_api"])
+        summarizer_cfg = cfg.get("summarizer")
+        if isinstance(summarizer_cfg, dict):
+            for key in summarizer_cfg:
+                if key != "summary_turn_interval":
+                    skipped.append(f"summarizer.{key}")
         return {"applied": applied, "skipped": skipped}
+
+    def _apply_turn_interval_to_summarizer(self) -> bool:
+        """
+        把插件层已生效的 ``self.turn_interval`` 回写到总结 Worker 实例。
+
+        设计要点：
+        1. summarizer 可能尚未装配（启动失败/未初始化），此时静默跳过，
+           待 `_build_summarizer()` 时自然读取新的 ``self.turn_interval``；
+        2. 优先调用 ``summarizer.set_turn_interval()`` 复用其校验与日志；
+           实例缺少该接口（旧版本/桩对象）时才直接写属性降级；
+        3. 任何异常都不抛出，配置热更新绝不能打断对话主链路。
+
+        :return: True 表示已同步（或无需同步），False 表示同步失败
+        """
+        summarizer = self.summarizer
+        if summarizer is None:
+            return True
+        try:
+            setter = getattr(summarizer, "set_turn_interval", None)
+            if callable(setter):
+                return bool(setter(self.turn_interval))
+            summarizer.turn_interval = self.turn_interval
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[agent_memory] 同步 turn_interval 到 summarizer 失败（忽略）: %s", exc
+            )
+            return False
 
     def _resolve_turn_interval(self) -> int:
         """解析 summary_turn_interval：顶层优先，其次 summarizer 子节点，默认 5。"""

@@ -404,7 +404,26 @@ class MemorySummarizer:
         return value if value > 0 else 20.0
 
     @staticmethod
-    def _parse_turn_interval(config: Dict[str, Any]) -> int:
+    def _coerce_turn_interval(raw: Any) -> Optional[int]:
+        """
+        单值校验：把任意入参转为合法的窗口阈值。
+
+        合法条件为「可转 int 且 > 0」；其余（None / "" / 非数字 / <=0）
+        一律返回 None，由调用方决定回退策略。
+
+        :param raw: 待校验的候选值
+        :return: 合法的正整数值，或 None 表示非法
+        """
+        if raw is None or raw == "":
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @classmethod
+    def _parse_turn_interval(cls, config: Dict[str, Any]) -> int:
         """
         解析 summary_turn_interval（默认 5 轮）：
         优先读取顶层 key，其次读取 config["summarizer"]["summary_turn_interval"]，
@@ -416,15 +435,51 @@ class MemorySummarizer:
             candidates.append(summarizer_cfg.get("summary_turn_interval"))
 
         for raw in candidates:
-            if raw is None or raw == "":
-                continue
-            try:
-                value = int(raw)
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
+            value = cls._coerce_turn_interval(raw)
+            if value is not None:
                 return value
         return 5
+
+    def set_turn_interval(self, value: Any) -> bool:
+        """
+        热更新窗口阈值（面板保存配置时由 ``apply_runtime_config`` 调用）。
+
+        行为约定：
+        1. 复用 :meth:`_coerce_turn_interval` 的校验逻辑，非法值**不修改**
+           当前阈值，返回 False，避免把运行中的窗口打成 0 或脏值；
+        2. 合法值写入 ``self.turn_interval`` 并同步回 ``self.config``，
+           使后续 ``get_buffer_stats()`` / 自检读到一致值；
+        3. **存量缓冲不回滚**：已缓冲的轮次保留，下一轮 ``enqueue_dialogue``
+           按新阈值判定，因此「调大阈值」时旧缓冲继续累积，「调小阈值」时
+           若已有缓冲达到新阈值则立即打包，语义均为「下一次判定生效」。
+
+        :param value: 候选阈值（int / 数字字符串等）
+        :return: True 表示已生效；False 表示校验失败、保持原值
+        """
+        new_interval = self._coerce_turn_interval(value)
+        if new_interval is None:
+            logger.warning(
+                "[MemorySummarizer] 拒绝非法 summary_turn_interval=%r，保持原值 %d",
+                value,
+                self.turn_interval,
+            )
+            return False
+
+        old_interval = self.turn_interval
+        self.turn_interval = new_interval
+        # config 同步回写：面板/状态指令读取的是同一份快照，避免新旧值漂移
+        try:
+            self.config["summary_turn_interval"] = new_interval
+        except Exception as exc:  # pragma: no cover - 极端只读映射兜底
+            logger.debug("[MemorySummarizer] 回写 config 失败（忽略）: %s", exc)
+
+        if old_interval != new_interval:
+            logger.info(
+                "[MemorySummarizer] summary_turn_interval 热更新: %d -> %d 轮",
+                old_interval,
+                new_interval,
+            )
+        return True
 
     def start(self) -> None:
         """启动后台异步消费 Task"""

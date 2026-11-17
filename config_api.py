@@ -79,16 +79,71 @@ DEFAULT_VALUE_MAP: Dict[str, Any] = {
     "dict": {},
 }
 
-#: 修改这些键后必须重载插件才能完全生效（面板会给出提示，但绝不自动重载）
+#: 修改这些键后必须重载插件才能完全生效（面板会给出提示，但绝不自动重载）。
+#:
+#: 语义约定：本元组必须与 ``main.apply_runtime_config()`` 的实际热更能力一致。
+#:   - ``db_path``            : 存储连接在装配期建立，改路径必须重载。
+#:   - ``models``             : Embedding/Rerank 客户端在装配期构建（虽有
+#:                              ``rebuild_provider_backends`` 手动重连，但保存配置
+#:                              本身不重建，故仍归为重载项）。
+#:   - ``migration``          : 迁移参数仅在显式执行迁移指令时读取，不影响已建链路。
+#:   - ``webui``              : 页面路由在 initialize() 时注册，改注册开关需重载。
+#:   - ``evaluator.api_``/
+#:     ``evaluator.model_name``/
+#:     ``evaluator.provider_id``: EvaluatorGate 在 summarizer 构造时快照凭证与模型名。
+#:   - ``graph.*``            : ``graph_enabled`` 等写侧阈值同样在构造期快照。
+#:   - ``summarizer.*``       : 仅 ``summary_turn_interval`` 例外可热更（由
+#:                              ``set_turn_interval()`` 精确回写），其余（provider /
+#:                              model / 凭证 / DLQ / 并发 / 超时）均需重载。
+#:
+#: 作用域边界：条目以 ``.`` 结尾表示「前缀匹配整棵子树」（如 ``graph.``）；
+#: 不含 ``.`` 的条目只做**精确键匹配 + 子键前缀匹配**（``db_path`` 命中
+#: ``db_path``，但不误伤 ``db_path_xxx`` 这类无关键）。
 RELOAD_REQUIRED_PREFIXES = (
     "db_path",
-    "summarizer",
+    "summarizer.",
     "models",
     "migration",
     "webui",
-    "evaluator.api_",
+    "evaluator.api_base",
+    "evaluator.api_key",
+    "evaluator.model_name",
+    "evaluator.model",
+    "evaluator.provider_id",
     "graph.",
 )
+
+#: 上述前缀中**明确可热更**的例外项（精确键，优先级高于前缀规则）。
+#: 例：``summarizer.summary_turn_interval`` 命中 ``summarizer.`` 前缀，
+#: 但实际由 ``MemorySummarizer.set_turn_interval()`` 即时生效，不应提示重载。
+RELOAD_EXEMPT_KEYS = (
+    "summarizer.summary_turn_interval",
+)
+
+
+def _is_reload_required(path: str) -> bool:
+    """
+    判定单个配置路径是否属于「需重载插件才完全生效」。
+
+    :param path: 变更项的点分路径，如 ``summarizer.api_key`` / ``db_path``
+    :return: True 表示需重载
+    """
+    key = str(path or "").strip()
+    if not key:
+        return False
+    # 例外项优先：可热更的键即使命中前缀也不提示重载
+    if key in RELOAD_EXEMPT_KEYS:
+        return False
+    for prefix in RELOAD_REQUIRED_PREFIXES:
+        if prefix.endswith("."):
+            # 子树前缀：``graph.`` 命中 ``graph.enable``
+            if key.startswith(prefix):
+                return True
+            continue
+        # 精确键或精确键的子键：``db_path`` / ``models.embedding.model``
+        if key == prefix or key.startswith(prefix + "."):
+            return True
+    return False
 
 
 class ConfigError(Exception):
@@ -530,10 +585,7 @@ class ConfigManager:
 
             self._atomic_write(self.config_path(), merged)
             applied = self._sync_runtime(merged)
-            requires_reload = any(
-                any(str(c).startswith(p.rstrip(".")) or str(c).startswith(p) for p in RELOAD_REQUIRED_PREFIXES)
-                for c in changes
-            )
+            requires_reload = any(_is_reload_required(c) for c in changes)
             result = {
                 "changed": sorted(set(changes)),
                 "applied": applied,
