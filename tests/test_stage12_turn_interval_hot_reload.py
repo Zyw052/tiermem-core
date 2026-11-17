@@ -166,9 +166,17 @@ def _new_summarizer(tmp_dir: Path, interval: int = 5) -> MemorySummarizer:
     )
 
 
-def _make_plugin(cfg: dict) -> AgentMemoryPlugin:
-    """构造插件实例（不执行 initialize，避免触碰网络与真实存储）。"""
-    return AgentMemoryPlugin(context=None, config=dict(cfg))
+def _make_plugin(cfg: dict, data_dir: Path) -> AgentMemoryPlugin:
+    """
+    构造插件实例（不执行 initialize，避免触碰网络）。
+
+    必须显式传入 ``db_path``：否则 ``_build_storage()`` 会走「默认数据目录」
+    分支并 ``mkdir`` 到宿主真实的 ``plugin_data/<PLUGIN_NAME>``，
+    使测试向现网数据目录写文件（本文件曾因此泄漏过 ``_test`` 目录）。
+    """
+    merged = dict(cfg)
+    merged.setdefault("db_path", str(Path(data_dir) / "agent_memory.db"))
+    return AgentMemoryPlugin(context=None, config=merged)
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +231,9 @@ def test_set_turn_interval_reuses_parser_semantics():
 def test_apply_runtime_config_writes_back_to_summarizer():
     """核心回归：热更新必须回写已构建的 summarizer（本次 bug 的修复点）。"""
     with tempfile.TemporaryDirectory(prefix="agent_memory_s12_") as tmp:
-        plugin = _make_plugin({"summary_turn_interval": 5, "enable_memory": True})
+        plugin = _make_plugin(
+            {"summary_turn_interval": 5, "enable_memory": True}, Path(tmp)
+        )
         plugin.summarizer = _new_summarizer(Path(tmp), interval=5)
         assert plugin.turn_interval == 5
         assert plugin.summarizer.turn_interval == 5
@@ -239,7 +249,7 @@ def test_apply_runtime_config_writes_back_to_summarizer():
 def test_apply_runtime_config_invalid_value_keeps_old():
     """非法配置值不得把运行窗口打成 0/1，也不得谎报已生效。"""
     with tempfile.TemporaryDirectory(prefix="agent_memory_s12_") as tmp:
-        plugin = _make_plugin({"summary_turn_interval": 6})
+        plugin = _make_plugin({"summary_turn_interval": 6}, Path(tmp))
         plugin.summarizer = _new_summarizer(Path(tmp), interval=6)
 
         result = plugin.apply_runtime_config({"summary_turn_interval": 0})
@@ -252,7 +262,7 @@ def test_apply_runtime_config_invalid_value_keeps_old():
 def test_apply_runtime_config_missing_key_is_noop():
     """未提交该键时保持原值，且仍视为可用（不触发告警路径）。"""
     with tempfile.TemporaryDirectory(prefix="agent_memory_s12_") as tmp:
-        plugin = _make_plugin({"summary_turn_interval": 6})
+        plugin = _make_plugin({"summary_turn_interval": 6}, Path(tmp))
         plugin.summarizer = _new_summarizer(Path(tmp), interval=6)
 
         result = plugin.apply_runtime_config({"enable_memory": True})
@@ -264,21 +274,22 @@ def test_apply_runtime_config_missing_key_is_noop():
 
 def test_apply_runtime_config_safe_when_summarizer_absent():
     """summarizer 尚未装配时热更新不抛异常（延迟到构建时生效）。"""
-    plugin = _make_plugin({"summary_turn_interval": 5})
-    plugin.summarizer = None
+    with tempfile.TemporaryDirectory(prefix="agent_memory_s12_") as tmp:
+        plugin = _make_plugin({"summary_turn_interval": 5}, Path(tmp))
+        plugin.summarizer = None
 
-    result = plugin.apply_runtime_config({"summary_turn_interval": 30})
+        result = plugin.apply_runtime_config({"summary_turn_interval": 30})
 
-    assert plugin.turn_interval == 30
-    assert "turn_interval" in result["applied"]
-    # 未装配时不应凭空创建实例
-    assert plugin.summarizer is None
+        assert plugin.turn_interval == 30
+        assert "turn_interval" in result["applied"]
+        # 未装配时不应凭空创建实例
+        assert plugin.summarizer is None
 
 
 def test_summarizer_skipped_list_matches_reload_semantics():
     """skipped 列表不得笼统声称 summarizer.* 全部跳过（阈值实际可热更）。"""
     with tempfile.TemporaryDirectory(prefix="agent_memory_s12_") as tmp:
-        plugin = _make_plugin({"summary_turn_interval": 5})
+        plugin = _make_plugin({"summary_turn_interval": 5}, Path(tmp))
         plugin.summarizer = _new_summarizer(Path(tmp), interval=5)
 
         result = plugin.apply_runtime_config(
@@ -313,7 +324,7 @@ async def test_window_5_to_20_no_flush_at_5_and_flush_at_20():
     若只调用 ``sm.set_turn_interval()`` 则无法捕获插件层漏回写的 bug。
     """
     with tempfile.TemporaryDirectory(prefix="agent_memory_s12_") as tmp:
-        plugin = _make_plugin({"summary_turn_interval": 5})
+        plugin = _make_plugin({"summary_turn_interval": 5}, Path(tmp))
         sm = _new_summarizer(Path(tmp), interval=5)
         plugin.summarizer = sm
         sid = "session_hot_5_to_20"
@@ -417,7 +428,7 @@ def test_config_save_reports_turn_interval_without_reload(tmp_path):
     )
 
     with tempfile.TemporaryDirectory(prefix="agent_memory_s12_") as tmp:
-        plugin = _make_plugin({"summary_turn_interval": 5})
+        plugin = _make_plugin({"summary_turn_interval": 5}, Path(tmp))
         plugin.summarizer = _new_summarizer(Path(tmp), interval=5)
 
         manager = config_api.ConfigManager(
