@@ -16,12 +16,11 @@ import sqlite3
 import struct
 import threading
 import time
-import logging
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-logger = logging.getLogger("astrbot_plugin_agent_memory.storage")
+from astrbot.api import logger
 
 # ---------------------------------------------------------------------------
 # 方案 B 增强：可选依赖（numpy 存在则启用矩阵乘法加速，缺失则纯 Python 回退）

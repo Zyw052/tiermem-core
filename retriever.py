@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import logging
 import math
 import re
 import sqlite3
@@ -22,10 +21,7 @@ import time
 from collections import Counter
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-try:
-    from astrbot.api import logger
-except Exception:  # pragma: no cover
-    logger = logging.getLogger("astrbot_plugin_agent_memory.retriever")
+from astrbot.api import logger
 
 try:
     from .models_client import (

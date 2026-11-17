@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 import sqlite3
 import struct
@@ -35,10 +34,7 @@ try:
 except ImportError:  # pragma: no cover
     aiohttp = None  # type: ignore
 
-try:
-    from astrbot.api import logger
-except Exception:  # pragma: no cover
-    logger = logging.getLogger("astrbot_plugin_agent_memory.summarizer")
+from astrbot.api import logger
 
 try:
     from .models_client import EmbeddingClient, RerankClient, cosine_similarity

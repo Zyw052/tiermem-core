@@ -33,12 +33,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
-try:  # 宿主日志
-    from astrbot.api import logger
-except Exception:  # pragma: no cover
-    import logging
-
-    logger = logging.getLogger("astrbot_plugin_agent_memory.page_api")
+from astrbot.api import logger
 
 PLUGIN_NAME = "astrbot_plugin_agent_memory"
 PAGE_API_PREFIX = f"/{PLUGIN_NAME}/page"

@@ -31,12 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-try:  # 宿主日志；脱离宿主时退化为标准 logging
-    from astrbot.api import logger
-except Exception:  # pragma: no cover
-    import logging
-
-    logger = logging.getLogger("astrbot_plugin_agent_memory.host_providers")
+from astrbot.api import logger
 
 
 #: 期望的能力类型标识（与宿主 ProviderType.value 对齐）

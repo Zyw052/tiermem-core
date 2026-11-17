@@ -27,14 +27,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
-# AstrBot 框架导入（logger 提供兜底，便于脱离宿主做静态检查与单测）
+# AstrBot 框架导入（logger 统一来自 astrbot.api，依据 §10.1）
 # ---------------------------------------------------------------------------
-try:
-    from astrbot.api import logger
-except Exception:  # pragma: no cover - 仅非 AstrBot 环境触发
-    import logging
-
-    logger = logging.getLogger("astrbot_plugin_agent_memory.main")
+from astrbot.api import logger
 
 from astrbot.api.star import Context, Star  # 依据 §3：主类继承 Star，宿主自动注册
 

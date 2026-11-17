@@ -12,7 +12,6 @@ astrbot_plugin_agent_memory - 资产无损迁移引擎 (migrator.py)
 import argparse
 import datetime
 import json
-import logging
 import os
 import shutil
 import sqlite3
@@ -22,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from storage import MemoryStorage
 
-logger = logging.getLogger("astrbot_plugin_agent_memory.migrator")
+from astrbot.api import logger
 
 def _env_path(env_key: str, fallback: str) -> Path:
     """优先读取环境变量，未设置时回退到内置默认路径。
@@ -651,10 +650,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
     args = _build_arg_parser().parse_args()
     migrator = MemoryMigrator(
         source_db_path=Path(args.source),

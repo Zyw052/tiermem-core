@@ -48,12 +48,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-try:  # 宿主日志；脱离宿主时退化为标准 logging
-    from astrbot.api import logger  # type: ignore
-except Exception:  # pragma: no cover
-    import logging
-
-    logger = logging.getLogger("astrbot_plugin_agent_memory.config_api")
+from astrbot.api import logger
 
 PLUGIN_NAME = "astrbot_plugin_agent_memory"
 SCHEMA_FILENAME = "_conf_schema.json"

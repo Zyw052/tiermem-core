@@ -8,7 +8,6 @@ astrbot_plugin_agent_memory - 向量与重排序模型客户端 (models_client.p
 
 from __future__ import annotations
 
-import logging
 import math
 import re
 from collections import Counter
@@ -24,10 +23,7 @@ try:
 except ImportError:  # pragma: no cover
     np = None  # type: ignore
 
-try:
-    from astrbot.api import logger
-except Exception:  # pragma: no cover
-    logger = logging.getLogger("astrbot_plugin_agent_memory.models_client")
+from astrbot.api import logger
 
 
 class _HttpSessionOwner:

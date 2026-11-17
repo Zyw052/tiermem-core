@@ -39,12 +39,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, Iterable, List, Pattern, Tuple
 
-try:  # 宿主日志；脱离宿主时退化为标准 logging
-    from astrbot.api import logger
-except Exception:  # pragma: no cover
-    import logging
-
-    logger = logging.getLogger("astrbot_plugin_agent_memory.noise_filter")
+from astrbot.api import logger
 
 
 # ---------------------------------------------------------------------------

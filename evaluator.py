@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -30,10 +29,7 @@ try:
 except ImportError:  # pragma: no cover
     aiohttp = None  # type: ignore
 
-try:
-    from astrbot.api import logger
-except Exception:  # pragma: no cover
-    logger = logging.getLogger("astrbot_plugin_agent_memory.evaluator")
+from astrbot.api import logger
 
 
 # ---------------------------------------------------------------------------
